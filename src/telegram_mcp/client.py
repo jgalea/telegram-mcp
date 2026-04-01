@@ -4,45 +4,52 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from telethon import TelegramClient
-from telethon.tl.types import (
-    Channel, Chat, User, Message,
-    InputPeerChannel, InputPeerChat, InputPeerUser,
-    MessageMediaPhoto, MessageMediaDocument, MessageMediaGeo,
+from telethon.tl.functions.channels import (
+    EditBannedRequest,
+    EditPhotoRequest,
+    EditTitleRequest,
+    GetAdminLogRequest,
+    GetParticipantsRequest,
+    InviteToChannelRequest,
+)
+from telethon.tl.functions.contacts import (
+    BlockRequest,
+    GetContactsRequest,
+    UnblockRequest,
 )
 from telethon.tl.functions.messages import (
+    ExportChatInviteRequest,
     GetScheduledHistoryRequest,
     SendReactionRequest,
 )
-from telethon.tl.functions.channels import (
-    GetAdminLogRequest,
-    EditTitleRequest,
-    EditPhotoRequest,
-    GetParticipantsRequest,
-    InviteToChannelRequest,
-    EditBannedRequest,
-)
-from telethon.tl.functions.messages import ExportChatInviteRequest
-from telethon.tl.functions.contacts import (
-    GetContactsRequest,
-    BlockRequest,
-    UnblockRequest,
-)
 from telethon.tl.types import (
+    Channel,
     ChannelParticipantsSearch,
+    Chat,
     ChatBannedRights,
+    Message,
+    MessageMediaDocument,
+    MessageMediaGeo,
+    MessageMediaPhoto,
     ReactionEmoji,
+    User,
 )
 
 from telegram_mcp.cache import MessageCache
+from telegram_mcp.login import CONFIG_DIR, DOWNLOADS_DIR, SESSION_PATH, load_config
 from telegram_mcp.security import (
-    fence, validate_chat_id, validate_message_length, is_path_allowed,
-    sanitize_filename, RateLimiter, ensure_dir,
+    RateLimiter,
+    ensure_dir,
+    fence,
+    is_path_allowed,
+    sanitize_filename,
+    validate_chat_id,
+    validate_message_length,
 )
-from telegram_mcp.login import CONFIG_DIR, load_config, SESSION_PATH, DOWNLOADS_DIR
 
 
 def _msg_to_dict(msg: Message) -> dict[str, Any]:
@@ -53,7 +60,8 @@ def _msg_to_dict(msg: Message) -> dict[str, Any]:
     if sender:
         sender_id = sender.id
         if isinstance(sender, User):
-            sender_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip() or sender.username
+            full_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip()
+            sender_name = full_name or sender.username
         elif hasattr(sender, "title"):
             sender_name = sender.title
 
