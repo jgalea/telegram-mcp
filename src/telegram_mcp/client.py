@@ -125,6 +125,11 @@ class TelegramMCPClient:
             os.path.expanduser("~/Documents"),
         ])
 
+        # Stale cache cleanup
+        cache_max_age = config.get("cache_max_age_days")
+        if cache_max_age is not None:
+            self._cache.prune(int(cache_max_age))
+
         ensure_dir(DOWNLOADS_DIR)
 
     async def connect(self) -> None:
@@ -277,18 +282,44 @@ class TelegramMCPClient:
 
     async def search_messages(
         self, query: str, chat_id: int | str | None = None, limit: int = 20,
+        chat_type: str | None = None,
     ) -> list[dict[str, Any]]:
         self._rl_search.acquire()
         kwargs: dict[str, Any] = {"limit": min(limit, 100)}
-        entity = None
-        if chat_id:
-            chat_id = validate_chat_id(chat_id)
-            entity = await self._client.get_entity(chat_id)
 
-        # Live search
-        messages = await self._client.get_messages(entity, search=query, **kwargs)
-        live_results = [_msg_to_dict(m) for m in messages if isinstance(m, Message)]
-        self._cache_messages(live_results)
+        if chat_type and chat_type not in ("user", "group", "channel"):
+            raise ValueError(f"Invalid chat_type: {chat_type}. Must be user, group, or channel.")
+
+        # When filtering by chat_type, search across matching chats
+        if chat_type and not chat_id:
+            dialogs = await self._client.get_dialogs(limit=200)
+            matching_entities = []
+            for d in dialogs:
+                dtype = "user"
+                if isinstance(d.entity, Channel):
+                    dtype = "channel" if d.entity.broadcast else "group"
+                elif isinstance(d.entity, Chat):
+                    dtype = "group"
+                if dtype == chat_type:
+                    matching_entities.append(d.entity)
+
+            live_results: list[dict[str, Any]] = []
+            for ent in matching_entities:
+                msgs = await self._client.get_messages(ent, search=query, **kwargs)
+                live_results.extend(
+                    _msg_to_dict(m) for m in msgs if isinstance(m, Message)
+                )
+            self._cache_messages(live_results)
+        else:
+            entity = None
+            if chat_id:
+                chat_id = validate_chat_id(chat_id)
+                entity = await self._client.get_entity(chat_id)
+
+            # Live search
+            messages = await self._client.get_messages(entity, search=query, **kwargs)
+            live_results = [_msg_to_dict(m) for m in messages if isinstance(m, Message)]
+            self._cache_messages(live_results)
 
         # Merge with cache
         cache_results = self._cache.search(
@@ -334,20 +365,26 @@ class TelegramMCPClient:
     async def send_message(
         self, chat_id: int | str, text: str,
         reply_to: int | None = None,
+        parse_mode: str | None = None,
     ) -> dict[str, Any]:
         self._rl_write.acquire()
         chat_id = validate_chat_id(chat_id)
         validate_message_length(text)
-        msg = await self._client.send_message(chat_id, text, reply_to=reply_to)
+        msg = await self._client.send_message(
+            chat_id, text, reply_to=reply_to, parse_mode=parse_mode,
+        )
         return _msg_to_dict(msg)
 
     async def edit_message(
         self, chat_id: int | str, message_id: int, text: str,
+        parse_mode: str | None = None,
     ) -> dict[str, Any]:
         self._rl_write.acquire()
         chat_id = validate_chat_id(chat_id)
         validate_message_length(text)
-        msg = await self._client.edit_message(chat_id, message_id, text)
+        msg = await self._client.edit_message(
+            chat_id, message_id, text, parse_mode=parse_mode,
+        )
         return _msg_to_dict(msg)
 
     async def delete_message(
@@ -637,3 +674,36 @@ class TelegramMCPClient:
     async def clear_cache(self) -> dict[str, str]:
         self._cache.clear()
         return {"status": "cache_cleared"}
+
+    async def get_new_messages(
+        self, since: str, chat_id: int | str | None = None, limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Get messages newer than *since* (ISO datetime). Optionally scoped to a chat."""
+        self._rl_fetch.acquire()
+        since_dt = datetime.fromisoformat(since)
+        limit = min(limit, 200)
+
+        if chat_id:
+            chat_id = validate_chat_id(chat_id)
+            messages = await self._client.get_messages(
+                chat_id, limit=limit, offset_date=None,
+            )
+            results = [
+                _msg_to_dict(m)
+                for m in messages
+                if isinstance(m, Message) and m.date and m.date >= since_dt
+            ]
+        else:
+            dialogs = await self._client.get_dialogs(limit=50)
+            results: list[dict[str, Any]] = []
+            for d in dialogs:
+                if d.date and d.date < since_dt:
+                    continue
+                msgs = await self._client.get_messages(d.entity, limit=min(limit, 10))
+                for m in msgs:
+                    if isinstance(m, Message) and m.date and m.date >= since_dt:
+                        results.append(_msg_to_dict(m))
+
+        self._cache_messages(results)
+        results.sort(key=lambda m: m.get("date", ""), reverse=True)
+        return [_fence_message(m) for m in results[:limit]]

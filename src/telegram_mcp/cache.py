@@ -148,6 +148,15 @@ class MessageCache:
     # Maintenance
     # ------------------------------------------------------------------
 
+    def prune(self, max_age_days: int) -> int:
+        """Delete messages older than *max_age_days* and return the count removed."""
+        from datetime import timedelta
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+        cursor = self._conn.execute("DELETE FROM messages WHERE date < ?", (cutoff,))
+        self._conn.commit()
+        return cursor.rowcount
+
     def clear(self) -> None:
         """Delete all messages and chats from the cache."""
         self._conn.execute("DELETE FROM messages")

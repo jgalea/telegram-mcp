@@ -5,7 +5,7 @@ from telegram_mcp.server import DESTRUCTIVE_TOOLS, TOOLS
 
 class TestToolRegistration:
     def test_tool_count(self):
-        assert len(TOOLS) == 45
+        assert len(TOOLS) == 46
 
     def test_all_tools_have_names(self):
         for tool in TOOLS:
@@ -38,3 +38,29 @@ class TestToolRegistration:
                 assert "DESTRUCTIVE" in tool.description, (
                     f"{tool.name} should mention DESTRUCTIVE"
                 )
+
+    def test_get_new_messages_tool_exists(self):
+        names = [t.name for t in TOOLS]
+        assert "get_new_messages" in names
+
+    def test_get_new_messages_requires_since(self):
+        tool = next(t for t in TOOLS if t.name == "get_new_messages")
+        assert "since" in tool.inputSchema.get("required", [])
+
+    def test_search_messages_has_chat_type(self):
+        tool = next(t for t in TOOLS if t.name == "search_messages")
+        props = tool.inputSchema.get("properties", {})
+        assert "chat_type" in props
+        assert props["chat_type"]["enum"] == ["user", "group", "channel"]
+
+    def test_send_message_has_parse_mode(self):
+        tool = next(t for t in TOOLS if t.name == "send_message")
+        props = tool.inputSchema.get("properties", {})
+        assert "parse_mode" in props
+        assert props["parse_mode"]["enum"] == ["md", "html"]
+
+    def test_edit_message_has_parse_mode(self):
+        tool = next(t for t in TOOLS if t.name == "edit_message")
+        props = tool.inputSchema.get("properties", {})
+        assert "parse_mode" in props
+        assert props["parse_mode"]["enum"] == ["md", "html"]

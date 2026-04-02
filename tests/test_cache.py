@@ -197,6 +197,43 @@ class TestGetMessageIds:
         assert existing == {1, 2}
 
 
+class TestPrune:
+    def test_prune_removes_old_messages(self, cache):
+        """prune() deletes messages older than max_age_days."""
+        # Old message — 90 days ago
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Old message", date="2025-12-01T10:00:00+00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        # Recent message — today
+        cache.cache_message(
+            msg_id=2, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Recent message", date="2026-03-31T10:00:00+00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        removed = cache.prune(max_age_days=30)
+        assert removed == 1
+        results = cache.search("message")
+        assert len(results) == 1
+        assert results[0]["text"] == "Recent message"
+
+    def test_prune_keeps_all_when_none_old(self, cache):
+        """prune() with no old messages removes nothing."""
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Fresh", date="2026-03-31T10:00:00+00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        removed = cache.prune(max_age_days=30)
+        assert removed == 0
+        assert len(cache.search("Fresh")) == 1
+
+    def test_prune_empty_cache(self, cache):
+        """prune() on an empty cache returns 0."""
+        assert cache.prune(max_age_days=30) == 0
+
+
 class TestClear:
     def test_clear_wipes_all_data(self, cache):
         """clear() removes all messages and chats."""

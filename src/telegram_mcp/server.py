@@ -145,11 +145,16 @@ TOOLS = [
     ),
     _tool(
         "search_messages",
-        "Search messages by keyword, optionally in a specific chat",
+        "Search messages by keyword, optionally in a specific chat or chat type",
         {
             "query": {"type": "string"},
             "chat_id": {"type": ["integer", "string"]},
             "limit": {"type": "integer", "default": 20},
+            "chat_type": {
+                "type": "string",
+                "enum": ["user", "group", "channel"],
+                "description": "Filter search to only this chat type",
+            },
         },
         required=["query"],
     ),
@@ -186,6 +191,11 @@ TOOLS = [
             "chat_id": {"type": ["integer", "string"]},
             "text": {"type": "string"},
             "reply_to": {"type": "integer"},
+            "parse_mode": {
+                "type": "string",
+                "enum": ["md", "html"],
+                "description": "Message formatting: 'md' for Markdown, 'html' for HTML",
+            },
         },
         required=["chat_id", "text"],
     ),
@@ -196,6 +206,11 @@ TOOLS = [
             "chat_id": {"type": ["integer", "string"]},
             "message_id": {"type": "integer"},
             "text": {"type": "string"},
+            "parse_mode": {
+                "type": "string",
+                "enum": ["md", "html"],
+                "description": "Message formatting: 'md' for Markdown, 'html' for HTML",
+            },
         },
         required=["chat_id", "message_id", "text"],
     ),
@@ -409,6 +424,22 @@ TOOLS = [
         required=["chat_id"],
     ),
     _tool("clear_cache", "Wipe the local message cache", {}),
+    _tool(
+        "get_new_messages",
+        "Get messages newer than a timestamp (polling pattern for real-time awareness)",
+        {
+            "since": {
+                "type": "string",
+                "description": "ISO datetime — only return messages after this time",
+            },
+            "chat_id": {
+                "type": ["integer", "string"],
+                "description": "Optional: scope to a specific chat",
+            },
+            "limit": {"type": "integer", "default": 50},
+        },
+        required=["since"],
+    ),
 ]
 
 
