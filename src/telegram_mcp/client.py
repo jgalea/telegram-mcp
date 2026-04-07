@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from telethon import TelegramClient
 from telethon.tl.functions.channels import (
@@ -141,6 +144,26 @@ class TelegramMCPClient:
             self._connected = True
             self._start_listener()
 
+    async def ensure_connected(self) -> None:
+        """Reconnect if the Telegram connection has dropped."""
+        if self._client.is_connected():
+            return
+        logger.warning("Telegram connection lost, reconnecting...")
+        self._connected = False
+        for attempt in range(3):
+            try:
+                await self._client.connect()
+                if await self._client.is_user_authorized():
+                    self._connected = True
+                    logger.info("Reconnected to Telegram (attempt %d)", attempt + 1)
+                    return
+            except Exception as e:
+                logger.warning("Reconnect attempt %d failed: %s", attempt + 1, e)
+                if attempt < 2:
+                    import asyncio
+                    await asyncio.sleep(2 ** attempt)
+        raise ConnectionError("Failed to reconnect to Telegram after 3 attempts")
+
     def _start_listener(self) -> None:
         """Register a Telethon event handler that caches all incoming messages."""
         from telethon import events
@@ -155,8 +178,8 @@ class TelegramMCPClient:
             try:
                 msg_dict = _msg_to_dict(msg)
                 self._cache_messages([msg_dict])
-            except Exception:
-                pass  # Don't let cache errors break message reception
+            except Exception as e:
+                logger.debug("Cache error on incoming message: %s", e)
 
     async def disconnect(self) -> None:
         """Disconnect from Telegram."""
@@ -853,8 +876,8 @@ class TelegramMCPClient:
                     if len(batch) >= 200:
                         self._cache.insert_batch(batch)
                         batch.clear()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Error syncing chat %s: %s", d.name, e)
 
             if batch:
                 self._cache.insert_batch(batch)

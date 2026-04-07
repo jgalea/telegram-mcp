@@ -622,14 +622,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         )
 
     try:
+        await _client.ensure_connected()
+
         method = getattr(_client, name, None)
         if method is None:
             return _error(f"Unknown tool: {name}")
 
         # Remove 'confirm' from args before passing to client
         args = {k: v for k, v in arguments.items() if k != "confirm"}
-        result = await method(**args)
+        result = await asyncio.wait_for(method(**args), timeout=120)
         return _text(result)
+    except asyncio.TimeoutError:
+        return _error(f"Tool '{name}' timed out after 120 seconds")
+    except ConnectionError as e:
+        return _error(str(e))
     except Exception as e:
         return _error(str(e))
 

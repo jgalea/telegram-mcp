@@ -41,14 +41,21 @@ Run the login command once to create your Telegram session:
 telegram-mcp login
 ```
 
-This will prompt for:
+You'll need a Telegram API ID and hash first. To get them:
+
+1. Go to [my.telegram.org](https://my.telegram.org) and log in with your phone number
+2. Click **API development tools**
+3. If you already have an app, use those credentials. Telegram only allows one API app per account, and the same api_id/api_hash work for any Telegram project.
+4. If not, fill in the form: App title (e.g. "telegram-mcp"), Short name (anything), Platform: "Other". Description can be left blank. Click **Create application**.
+5. Copy the **App api_id** (a number) and **App api_hash** (a hex string)
+
+The login command will prompt for these if not already configured, then ask for:
+
 1. Your phone number
 2. The verification code Telegram sends you
 3. Your 2FA password (if enabled)
 
 The session is saved to `~/.telegram-mcp/session.session`. You only need to do this once.
-
-You'll need a Telegram API ID and hash from [my.telegram.org](https://my.telegram.org). The login command will prompt for these if not already configured.
 
 ### Connect to Claude Code
 

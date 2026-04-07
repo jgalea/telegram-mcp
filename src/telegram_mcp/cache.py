@@ -116,7 +116,10 @@ class MessageCache:
         before: str | None = None,
     ) -> list[dict]:
         """Search cached messages using a Python regex pattern (case-insensitive)."""
-        regex = re.compile(pattern, re.IGNORECASE)
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error as e:
+            raise ValueError(f"Invalid regex pattern: {e}") from e
         sql = "SELECT * FROM messages WHERE text IS NOT NULL"
         params: list = []
 
