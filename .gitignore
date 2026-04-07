@@ -6,3 +6,6 @@ dist/
 build/
 .eggs/
 *.session
+CLAUDE.md
+docs/superpowers/
+docs/prd-*.md
