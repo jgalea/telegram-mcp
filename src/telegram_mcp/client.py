@@ -7,7 +7,7 @@ import os
 from datetime import datetime
 from typing import Any
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.tl.functions.channels import (
     EditBannedRequest,
     EditPhotoRequest,
@@ -143,6 +143,8 @@ class TelegramMCPClient:
 
     def _start_listener(self) -> None:
         """Register a Telethon event handler that caches all incoming messages."""
+        from telethon import events
+
         @self._client.on(events.NewMessage)
         async def _on_new_message(event):
             msg = event.message
