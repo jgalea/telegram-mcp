@@ -250,6 +250,342 @@ class TestClear:
         assert cache.get_cached_chats() == []
 
 
+class TestGetLastMsgId:
+    def test_returns_none_for_empty_chat(self, cache):
+        assert cache.get_last_msg_id(999) is None
+
+    def test_returns_highest_msg_id(self, cache):
+        for msg_id in [5, 10, 3, 8]:
+            cache.cache_message(
+                msg_id=msg_id, chat_id=100, sender_id=200, sender_name="Alice",
+                text=f"Msg {msg_id}", date="2026-04-07T10:00:00",
+                reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+            )
+        assert cache.get_last_msg_id(100) == 10
+
+    def test_scoped_to_chat(self, cache):
+        cache.cache_message(
+            msg_id=50, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Chat 100", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=99, chat_id=200, sender_id=300, sender_name="Bob",
+            text="Chat 200", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        assert cache.get_last_msg_id(100) == 50
+
+
+class TestInsertBatch:
+    def test_inserts_multiple_messages(self, cache):
+        messages = [
+            {
+                "id": i, "chat_id": 100, "sender_id": 200, "sender_name": "Alice",
+                "text": f"Batch msg {i}", "date": f"2026-04-07T10:{i:02d}:00",
+                "reply_to_id": None, "media_type": None, "edited": None, "raw_json": "{}",
+            }
+            for i in range(5)
+        ]
+        count = cache.insert_batch(messages)
+        assert count == 5
+        results = cache.search("Batch msg")
+        assert len(results) == 5
+
+    def test_skips_duplicates(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Existing", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        messages = [
+            {
+                "id": 1, "chat_id": 100, "sender_id": 200, "sender_name": "Alice",
+                "text": "Duplicate", "date": "2026-04-07T10:00:00",
+                "reply_to_id": None, "media_type": None, "edited": None, "raw_json": "{}",
+            },
+            {
+                "id": 2, "chat_id": 100, "sender_id": 200, "sender_name": "Alice",
+                "text": "New", "date": "2026-04-07T10:01:00",
+                "reply_to_id": None, "media_type": None, "edited": None, "raw_json": "{}",
+            },
+        ]
+        count = cache.insert_batch(messages)
+        assert count == 1
+
+    def test_empty_batch_returns_zero(self, cache):
+        assert cache.insert_batch([]) == 0
+
+
+class TestSearchRegex:
+    def test_basic_regex_match(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Error code 404 found", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=2, chat_id=100, sender_id=200, sender_name="Alice",
+            text="All systems normal", date="2026-04-07T10:01:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.search_regex(r"code \d+")
+        assert len(results) == 1
+        assert results[0]["text"] == "Error code 404 found"
+
+    def test_regex_case_insensitive(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="ERROR: something failed", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.search_regex(r"error")
+        assert len(results) == 1
+
+    def test_regex_with_chat_filter(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Hello from 100", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=2, chat_id=200, sender_id=300, sender_name="Bob",
+            text="Hello from 200", date="2026-04-07T10:01:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.search_regex(r"Hello", chat_id=100)
+        assert len(results) == 1
+        assert results[0]["chat_id"] == 100
+
+    def test_regex_respects_limit(self, cache):
+        for i in range(10):
+            cache.cache_message(
+                msg_id=i, chat_id=100, sender_id=200, sender_name="Alice",
+                text=f"Match {i}", date=f"2026-04-07T10:{i:02d}:00",
+                reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+            )
+        results = cache.search_regex(r"Match \d+", limit=3)
+        assert len(results) == 3
+
+    def test_regex_no_match(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Hello world", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.search_regex(r"^goodbye")
+        assert results == []
+
+    def test_regex_with_after_filter(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Old match", date="2026-04-01T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=2, chat_id=100, sender_id=200, sender_name="Alice",
+            text="New match", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.search_regex(r"match", after="2026-04-05T00:00:00")
+        assert len(results) == 1
+        assert results[0]["text"] == "New match"
+
+
+class TestTopSenders:
+    def test_returns_senders_by_count(self, cache):
+        for i in range(5):
+            cache.cache_message(
+                msg_id=i, chat_id=100, sender_id=200, sender_name="Alice",
+                text=f"Msg {i}", date=f"2026-04-07T10:{i:02d}:00",
+                reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+            )
+        for i in range(5, 8):
+            cache.cache_message(
+                msg_id=i, chat_id=100, sender_id=300, sender_name="Bob",
+                text=f"Msg {i}", date=f"2026-04-07T10:{i:02d}:00",
+                reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+            )
+        results = cache.top_senders(chat_id=100)
+        assert len(results) == 2
+        assert results[0]["sender_name"] == "Alice"
+        assert results[0]["msg_count"] == 5
+        assert results[1]["sender_name"] == "Bob"
+        assert results[1]["msg_count"] == 3
+
+    def test_respects_limit(self, cache):
+        for i in range(10):
+            cache.cache_message(
+                msg_id=i, chat_id=100, sender_id=i, sender_name=f"User{i}",
+                text=f"Msg {i}", date="2026-04-07T10:00:00",
+                reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+            )
+        results = cache.top_senders(chat_id=100, limit=3)
+        assert len(results) == 3
+
+    def test_with_after_filter(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Old", date="2026-04-01T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=2, chat_id=100, sender_id=300, sender_name="Bob",
+            text="New", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.top_senders(chat_id=100, after="2026-04-05T00:00:00")
+        assert len(results) == 1
+        assert results[0]["sender_name"] == "Bob"
+
+    def test_all_chats(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="A", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=2, chat_id=200, sender_id=200, sender_name="Alice",
+            text="B", date="2026-04-07T10:01:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.top_senders()
+        assert len(results) == 1
+        assert results[0]["msg_count"] == 2
+
+
+class TestTimeline:
+    def test_groups_by_day(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Day 1 msg 1", date="2026-04-06T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=2, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Day 1 msg 2", date="2026-04-06T15:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=3, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Day 2 msg 1", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.timeline()
+        assert len(results) == 2
+        assert results[0]["period"] == "2026-04-06"
+        assert results[0]["msg_count"] == 2
+        assert results[1]["period"] == "2026-04-07"
+        assert results[1]["msg_count"] == 1
+
+    def test_groups_by_hour(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="10am", date="2026-04-07T10:15:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=2, chat_id=100, sender_id=200, sender_name="Alice",
+            text="10am too", date="2026-04-07T10:45:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=3, chat_id=100, sender_id=200, sender_name="Alice",
+            text="11am", date="2026-04-07T11:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.timeline(granularity="hour")
+        assert len(results) == 2
+        assert results[0]["msg_count"] == 2
+        assert results[1]["msg_count"] == 1
+
+    def test_with_chat_id_filter(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Chat 100", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=2, chat_id=200, sender_id=300, sender_name="Bob",
+            text="Chat 200", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.timeline(chat_id=100)
+        assert len(results) == 1
+        assert results[0]["msg_count"] == 1
+
+
+class TestGetToday:
+    def test_returns_todays_messages(self, cache):
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:00:00")
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Today's message", date=today,
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=2, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Old message", date="2025-01-01T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.get_today()
+        assert len(results) == 1
+        assert results[0]["text"] == "Today's message"
+
+    def test_returns_empty_when_no_today(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Old", date="2025-01-01T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.get_today()
+        assert results == []
+
+
+class TestExportMessages:
+    def test_export_returns_all_chat_messages(self, cache):
+        for i in range(3):
+            cache.cache_message(
+                msg_id=i, chat_id=100, sender_id=200, sender_name="Alice",
+                text=f"Export msg {i}", date=f"2026-04-07T10:{i:02d}:00",
+                reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+            )
+        results = cache.export_messages(chat_id=100)
+        assert len(results) == 3
+        assert results[0]["text"] == "Export msg 0"
+        assert results[2]["text"] == "Export msg 2"
+
+    def test_export_with_date_filters(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Old", date="2026-04-01T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=2, chat_id=100, sender_id=200, sender_name="Alice",
+            text="New", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.export_messages(chat_id=100, after="2026-04-05T00:00:00")
+        assert len(results) == 1
+        assert results[0]["text"] == "New"
+
+    def test_export_all_chats(self, cache):
+        cache.cache_message(
+            msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
+            text="Chat 100", date="2026-04-07T10:00:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        cache.cache_message(
+            msg_id=2, chat_id=200, sender_id=300, sender_name="Bob",
+            text="Chat 200", date="2026-04-07T10:01:00",
+            reply_to_id=None, media_type=None, edited=None, raw_json="{}",
+        )
+        results = cache.export_messages()
+        assert len(results) == 2
+
+
 class TestClose:
     def test_close_closes_connection(self, tmp_path):
         """close() closes the DB connection."""

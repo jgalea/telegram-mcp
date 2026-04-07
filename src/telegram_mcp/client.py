@@ -7,7 +7,7 @@ import os
 from datetime import datetime
 from typing import Any
 
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.tl.functions.channels import (
     EditBannedRequest,
     EditPhotoRequest,
@@ -139,6 +139,22 @@ class TelegramMCPClient:
             if not await self._client.is_user_authorized():
                 raise RuntimeError("Not authorized. Run 'telegram-mcp login' first.")
             self._connected = True
+            self._start_listener()
+
+    def _start_listener(self) -> None:
+        """Register a Telethon event handler that caches all incoming messages."""
+        @self._client.on(events.NewMessage)
+        async def _on_new_message(event):
+            msg = event.message
+            if not isinstance(msg, Message):
+                return
+            if msg.text is None and msg.message is None:
+                return
+            try:
+                msg_dict = _msg_to_dict(msg)
+                self._cache_messages([msg_dict])
+            except Exception:
+                pass  # Don't let cache errors break message reception
 
     async def disconnect(self) -> None:
         """Disconnect from Telegram."""
@@ -331,13 +347,28 @@ class TelegramMCPClient:
 
         return [_fence_message(m) for m in merged[:limit]]
 
+    async def search_regex(
+        self, pattern: str, chat_id: int | str | None = None, limit: int = 20,
+        after: str | None = None, before: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search cached messages using a regex pattern."""
+        resolved_chat_id = None
+        if chat_id:
+            chat_id = validate_chat_id(chat_id)
+            resolved_chat_id = chat_id if isinstance(chat_id, int) else None
+
+        results = self._cache.search_regex(
+            pattern, chat_id=resolved_chat_id, limit=limit, after=after, before=before,
+        )
+        return [_fence_message(m) for m in results]
+
     async def get_message(self, chat_id: int | str, message_id: int) -> dict[str, Any]:
         self._rl_fetch.acquire()
         chat_id = validate_chat_id(chat_id)
-        msgs = await self._client.get_messages(chat_id, ids=message_id)
-        if not msgs or not msgs[0]:
+        msg = await self._client.get_messages(chat_id, ids=message_id)
+        if not msg:
             raise ValueError(f"Message {message_id} not found")
-        result = _msg_to_dict(msgs[0])
+        result = _msg_to_dict(msg)
         self._cache_messages([result])
         return _fence_message(result)
 
@@ -446,10 +477,10 @@ class TelegramMCPClient:
     async def download_media(self, chat_id: int | str, message_id: int) -> dict[str, str]:
         self._rl_fetch.acquire()
         chat_id = validate_chat_id(chat_id)
-        msgs = await self._client.get_messages(chat_id, ids=message_id)
-        if not msgs or not msgs[0] or not msgs[0].media:
+        msg = await self._client.get_messages(chat_id, ids=message_id)
+        if not msg or not msg.media:
             raise ValueError("Message has no media")
-        path = await self._client.download_media(msgs[0], file=DOWNLOADS_DIR)
+        path = await self._client.download_media(msg, file=DOWNLOADS_DIR)
         if path:
             # Sanitize the downloaded filename
             basename = sanitize_filename(os.path.basename(path))
@@ -458,6 +489,70 @@ class TelegramMCPClient:
                 os.rename(path, final_path)
             return {"path": final_path, "filename": basename}
         raise ValueError("Failed to download media")
+
+    async def download_chat_media(
+        self, chat_id: int | str, limit: int = 50,
+        media_type: str = "photo", output_dir: str | None = None,
+    ) -> dict[str, Any]:
+        """Download media files from a chat in bulk."""
+        self._rl_fetch.acquire()
+        chat_id = validate_chat_id(chat_id)
+        entity = await self._client.get_entity(chat_id)
+
+        target_dir = output_dir or DOWNLOADS_DIR
+        if output_dir and not is_path_allowed(output_dir, self._upload_dirs + [DOWNLOADS_DIR]):
+            raise ValueError(
+                f"Output directory not in allowed paths. Allowed: {DOWNLOADS_DIR}"
+            )
+        ensure_dir(target_dir)
+
+        results: list[dict[str, Any]] = []
+        downloaded = 0
+
+        async for msg in self._client.iter_messages(entity, limit=min(limit, 200)):
+            if not isinstance(msg, Message) or not msg.media:
+                continue
+
+            classified = None
+            if isinstance(msg.media, MessageMediaPhoto):
+                classified = "photo"
+            elif isinstance(msg.media, MessageMediaDocument):
+                classified = "document"
+            else:
+                continue
+
+            if media_type != "all" and classified != media_type:
+                continue
+
+            try:
+                path = await self._client.download_media(msg, file=target_dir)
+                if path:
+                    basename = sanitize_filename(os.path.basename(path))
+                    final_path = os.path.join(target_dir, basename)
+                    if path != final_path:
+                        os.rename(path, final_path)
+                    results.append({
+                        "msg_id": msg.id,
+                        "media_type": classified,
+                        "path": final_path,
+                        "filename": basename,
+                    })
+                    downloaded += 1
+            except Exception as e:
+                results.append({
+                    "msg_id": msg.id,
+                    "media_type": classified,
+                    "error": str(e),
+                })
+
+            if downloaded >= limit:
+                break
+
+        return {
+            "chat_id": entity.id,
+            "downloaded": downloaded,
+            "files": results,
+        }
 
     async def send_file(
         self, chat_id: int | str, file_path: str, caption: str = "",
@@ -675,6 +770,135 @@ class TelegramMCPClient:
         self._cache.clear()
         return {"status": "cache_cleared"}
 
+    async def sync_chat(self, chat_id: int | str, limit: int = 1000) -> dict[str, Any]:
+        """Sync messages from a single chat into the local cache."""
+        self._rl_fetch.acquire()
+        chat_id = validate_chat_id(chat_id)
+        entity = await self._client.get_entity(chat_id)
+
+        chat_name = ""
+        chat_type = "user"
+        if isinstance(entity, User):
+            chat_name = f"{entity.first_name or ''} {entity.last_name or ''}".strip()
+        elif isinstance(entity, (Chat, Channel)):
+            chat_name = entity.title or ""
+            chat_type = "channel" if (isinstance(entity, Channel) and entity.broadcast) else "group"
+
+        min_id = self._cache.get_last_msg_id(entity.id) or 0
+        limit = min(limit, 5000)
+
+        batch: list[dict[str, Any]] = []
+        total_fetched = 0
+        BATCH_SIZE = 200
+
+        async for msg in self._client.iter_messages(entity, limit=limit, min_id=min_id):
+            if not isinstance(msg, Message):
+                continue
+            if msg.text is None and msg.message is None:
+                continue
+            batch.append(_msg_to_dict(msg))
+            total_fetched += 1
+
+            if len(batch) >= BATCH_SIZE:
+                self._cache.insert_batch(batch)
+                batch.clear()
+
+        if batch:
+            self._cache.insert_batch(batch)
+
+        self._cache.cache_chat(entity.id, chat_name, chat_type)
+        return {
+            "chat_id": entity.id,
+            "chat_name": chat_name,
+            "messages_synced": total_fetched,
+        }
+
+    async def sync_messages(
+        self, chat_id: int | str | None = None, limit: int = 1000,
+        max_chats: int = 50,
+    ) -> dict[str, Any]:
+        """Sync messages from all chats (or a specific chat) into the local cache."""
+        if chat_id:
+            return await self.sync_chat(chat_id, limit=limit)
+
+        self._rl_fetch.acquire()
+        dialogs = await self._client.get_dialogs(limit=max_chats)
+        results: list[dict[str, Any]] = []
+        total_messages = 0
+
+        for d in dialogs:
+            chat_type = "user"
+            if isinstance(d.entity, Channel):
+                chat_type = "channel" if d.entity.broadcast else "group"
+            elif isinstance(d.entity, Chat):
+                chat_type = "group"
+
+            min_id = self._cache.get_last_msg_id(d.entity.id) or 0
+            batch: list[dict[str, Any]] = []
+            chat_count = 0
+
+            try:
+                async for msg in self._client.iter_messages(
+                    d.entity, limit=min(limit, 1000), min_id=min_id
+                ):
+                    if not isinstance(msg, Message):
+                        continue
+                    if msg.text is None and msg.message is None:
+                        continue
+                    batch.append(_msg_to_dict(msg))
+                    chat_count += 1
+
+                    if len(batch) >= 200:
+                        self._cache.insert_batch(batch)
+                        batch.clear()
+            except Exception:
+                pass
+
+            if batch:
+                self._cache.insert_batch(batch)
+
+            self._cache.cache_chat(d.entity.id, d.name, chat_type)
+            total_messages += chat_count
+            results.append({
+                "chat_id": d.entity.id,
+                "chat_name": d.name,
+                "messages_synced": chat_count,
+            })
+
+        return {
+            "chats_synced": len(results),
+            "total_messages": total_messages,
+            "details": results,
+        }
+
+    async def message_timeline(
+        self, chat_id: int | str | None = None, granularity: str = "day",
+        after: str | None = None, before: str | None = None,
+    ) -> dict[str, Any]:
+        """Return message counts grouped by time period from the cache."""
+        resolved_chat_id = None
+        if chat_id:
+            chat_id = validate_chat_id(chat_id)
+            resolved_chat_id = chat_id if isinstance(chat_id, int) else None
+
+        entries = self._cache.timeline(
+            chat_id=resolved_chat_id, granularity=granularity,
+            after=after, before=before,
+        )
+        return {"granularity": granularity, "timeline": entries}
+
+    async def today_messages(
+        self, chat_id: int | str | None = None, limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return today's messages from the cache."""
+        resolved_chat_id = None
+        if chat_id:
+            chat_id = validate_chat_id(chat_id)
+            resolved_chat_id = chat_id if isinstance(chat_id, int) else None
+
+        results = self._cache.get_today(chat_id=resolved_chat_id, limit=limit)
+        return [_fence_message(m) for m in results]
+
     async def get_new_messages(
         self, since: str, chat_id: int | str | None = None, limit: int = 50,
     ) -> list[dict[str, Any]]:
@@ -707,3 +931,51 @@ class TelegramMCPClient:
         self._cache_messages(results)
         results.sort(key=lambda m: m.get("date", ""), reverse=True)
         return [_fence_message(m) for m in results[:limit]]
+
+    async def chat_analytics(
+        self, chat_id: int | str | None = None, limit: int = 20,
+        after: str | None = None, before: str | None = None,
+    ) -> dict[str, Any]:
+        """Return analytics for a chat: top senders and message counts from cache."""
+        resolved_chat_id = None
+        if chat_id:
+            chat_id = validate_chat_id(chat_id)
+            resolved_chat_id = chat_id if isinstance(chat_id, int) else None
+
+        top = self._cache.top_senders(
+            chat_id=resolved_chat_id, limit=limit, after=after, before=before,
+        )
+        return {
+            "top_senders": [
+                {"sender_name": fence(s["sender_name"], "sender"), "msg_count": s["msg_count"]}
+                for s in top
+            ],
+            "total_senders": len(top),
+        }
+
+    async def export_cached_messages(
+        self, chat_id: int | str | None = None, limit: int = 5000,
+        after: str | None = None, before: str | None = None,
+        format: str = "json",
+    ) -> dict[str, Any]:
+        """Export cached messages as JSON or CSV."""
+        resolved_chat_id = None
+        if chat_id:
+            chat_id = validate_chat_id(chat_id)
+            resolved_chat_id = chat_id if isinstance(chat_id, int) else None
+
+        messages = self._cache.export_messages(
+            chat_id=resolved_chat_id, limit=limit, after=after, before=before,
+        )
+
+        if format == "csv":
+            import csv
+            import io
+            output = io.StringIO()
+            if messages:
+                writer = csv.DictWriter(output, fieldnames=messages[0].keys())
+                writer.writeheader()
+                writer.writerows(messages)
+            return {"format": "csv", "count": len(messages), "data": output.getvalue()}
+
+        return {"format": "json", "count": len(messages), "messages": messages}

@@ -5,7 +5,7 @@ from telegram_mcp.server import DESTRUCTIVE_TOOLS, TOOLS
 
 class TestToolRegistration:
     def test_tool_count(self):
-        assert len(TOOLS) == 46
+        assert len(TOOLS) == 53
 
     def test_all_tools_have_names(self):
         for tool in TOOLS:
@@ -64,3 +64,46 @@ class TestToolRegistration:
         props = tool.inputSchema.get("properties", {})
         assert "parse_mode" in props
         assert props["parse_mode"]["enum"] == ["md", "html"]
+
+    def test_sync_messages_tool_exists(self):
+        names = [t.name for t in TOOLS]
+        assert "sync_messages" in names
+
+    def test_sync_messages_schema(self):
+        tool = next(t for t in TOOLS if t.name == "sync_messages")
+        props = tool.inputSchema.get("properties", {})
+        assert "chat_id" in props
+        assert "limit" in props
+        assert "max_chats" in props
+
+    def test_search_regex_tool_exists(self):
+        names = [t.name for t in TOOLS]
+        assert "search_regex" in names
+
+    def test_search_regex_requires_pattern(self):
+        tool = next(t for t in TOOLS if t.name == "search_regex")
+        assert "pattern" in tool.inputSchema.get("required", [])
+
+    def test_chat_analytics_tool_exists(self):
+        names = [t.name for t in TOOLS]
+        assert "chat_analytics" in names
+
+    def test_message_timeline_tool_exists(self):
+        names = [t.name for t in TOOLS]
+        assert "message_timeline" in names
+
+    def test_today_messages_tool_exists(self):
+        names = [t.name for t in TOOLS]
+        assert "today_messages" in names
+
+    def test_export_cached_messages_tool_exists(self):
+        names = [t.name for t in TOOLS]
+        assert "export_cached_messages" in names
+
+    def test_download_chat_media_tool_exists(self):
+        names = [t.name for t in TOOLS]
+        assert "download_chat_media" in names
+
+    def test_download_chat_media_requires_chat_id(self):
+        tool = next(t for t in TOOLS if t.name == "download_chat_media")
+        assert "chat_id" in tool.inputSchema.get("required", [])

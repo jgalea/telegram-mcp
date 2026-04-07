@@ -7,6 +7,7 @@ Used for local search and deduplication — not a sync engine.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 
@@ -106,6 +107,41 @@ class MessageCache:
         rows = self._conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
+    def search_regex(
+        self,
+        pattern: str,
+        chat_id: int | None = None,
+        limit: int = 50,
+        after: str | None = None,
+        before: str | None = None,
+    ) -> list[dict]:
+        """Search cached messages using a Python regex pattern (case-insensitive)."""
+        regex = re.compile(pattern, re.IGNORECASE)
+        sql = "SELECT * FROM messages WHERE text IS NOT NULL"
+        params: list = []
+
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(chat_id)
+        if after:
+            sql += " AND date >= ?"
+            params.append(after)
+        if before:
+            sql += " AND date <= ?"
+            params.append(before)
+
+        sql += " ORDER BY date DESC"
+        rows = self._conn.execute(sql, params).fetchall()
+
+        results: list[dict] = []
+        for row in rows:
+            msg = dict(row)
+            if regex.search(msg.get("text") or ""):
+                results.append(msg)
+                if len(results) >= limit:
+                    break
+        return results
+
     def get_message_ids(self, chat_id: int, msg_ids: list[int]) -> set[int]:
         """Return the subset of msg_ids that already exist in cache for a chat."""
         if not msg_ids:
@@ -116,6 +152,66 @@ class MessageCache:
             [chat_id, *msg_ids],
         ).fetchall()
         return {row["id"] for row in rows}
+
+    def top_senders(
+        self,
+        chat_id: int | None = None,
+        limit: int = 20,
+        after: str | None = None,
+        before: str | None = None,
+    ) -> list[dict]:
+        """Return top senders by message count, ordered descending."""
+        sql = (
+            "SELECT sender_name, sender_id, COUNT(*) as msg_count"
+            " FROM messages WHERE sender_name IS NOT NULL"
+        )
+        params: list = []
+
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(chat_id)
+        if after:
+            sql += " AND date >= ?"
+            params.append(after)
+        if before:
+            sql += " AND date <= ?"
+            params.append(before)
+
+        sql += " GROUP BY sender_id ORDER BY msg_count DESC LIMIT ?"
+        params.append(limit)
+
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_last_msg_id(self, chat_id: int) -> int | None:
+        """Return the highest message ID cached for a chat, or None."""
+        row = self._conn.execute(
+            "SELECT MAX(id) FROM messages WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    def insert_batch(self, messages: list[dict]) -> int:
+        """Batch-insert messages, skipping duplicates. Returns count of new rows."""
+        if not messages:
+            return 0
+        rows = [
+            (
+                m["id"], m["chat_id"], m.get("sender_id"), m.get("sender_name"),
+                m.get("text", ""), m["date"], m.get("reply_to_id"),
+                m.get("media_type"), m.get("edited"), m.get("raw_json", "{}"),
+            )
+            for m in messages
+        ]
+        before = self._conn.total_changes
+        self._conn.executemany(
+            """INSERT OR IGNORE INTO messages
+               (id, chat_id, sender_id, sender_name, text, date,
+                reply_to_id, media_type, edited, raw_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        self._conn.commit()
+        return self._conn.total_changes - before
 
     # ------------------------------------------------------------------
     # Chats
@@ -142,6 +238,79 @@ class MessageCache:
         rows = self._conn.execute(
             "SELECT * FROM chats ORDER BY last_seen DESC"
         ).fetchall()
+        return [dict(row) for row in rows]
+
+    def timeline(
+        self,
+        chat_id: int | None = None,
+        granularity: str = "day",
+        after: str | None = None,
+        before: str | None = None,
+    ) -> list[dict]:
+        """Group cached messages by time period, returning period and count."""
+        if granularity == "hour":
+            time_expr = "substr(date, 1, 13)"  # YYYY-MM-DDTHH
+        else:
+            time_expr = "substr(date, 1, 10)"  # YYYY-MM-DD
+
+        sql = f"SELECT {time_expr} as period, COUNT(*) as msg_count FROM messages WHERE 1=1"
+        params: list = []
+
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(chat_id)
+        if after:
+            sql += " AND date >= ?"
+            params.append(after)
+        if before:
+            sql += " AND date <= ?"
+            params.append(before)
+
+        sql += " GROUP BY period ORDER BY period ASC"
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_today(self, chat_id: int | None = None, limit: int = 5000) -> list[dict]:
+        """Return all cached messages from today (UTC)."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        sql = "SELECT * FROM messages WHERE date >= ?"
+        params: list = [f"{today}T00:00:00"]
+
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(chat_id)
+
+        sql += " ORDER BY date ASC LIMIT ?"
+        params.append(limit)
+
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def export_messages(
+        self,
+        chat_id: int | None = None,
+        limit: int = 5000,
+        after: str | None = None,
+        before: str | None = None,
+    ) -> list[dict]:
+        """Export cached messages in chronological order."""
+        sql = "SELECT * FROM messages WHERE 1=1"
+        params: list = []
+
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(chat_id)
+        if after:
+            sql += " AND date >= ?"
+            params.append(after)
+        if before:
+            sql += " AND date <= ?"
+            params.append(before)
+
+        sql += " ORDER BY date ASC LIMIT ?"
+        params.append(limit)
+
+        rows = self._conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------

@@ -159,6 +159,27 @@ TOOLS = [
         required=["query"],
     ),
     _tool(
+        "search_regex",
+        "Search cached messages using a regex pattern (runs locally, not against Telegram API)",
+        {
+            "pattern": {"type": "string", "description": "Python regex pattern"},
+            "chat_id": {
+                "type": ["integer", "string"],
+                "description": "Optional: search only this chat",
+            },
+            "limit": {"type": "integer", "default": 20},
+            "after": {
+                "type": "string",
+                "description": "ISO datetime — only messages after this time",
+            },
+            "before": {
+                "type": "string",
+                "description": "ISO datetime — only messages before this time",
+            },
+        },
+        required=["pattern"],
+    ),
+    _tool(
         "get_message",
         "Get a single message by ID",
         {
@@ -282,6 +303,32 @@ TOOLS = [
             "message_id": {"type": "integer"},
         },
         required=["chat_id", "message_id"],
+    ),
+    _tool(
+        "download_chat_media",
+        "Download media files (photos, documents) from a chat in bulk",
+        {
+            "chat_id": {
+                "type": ["integer", "string"],
+                "description": "Chat to download from",
+            },
+            "limit": {
+                "type": "integer",
+                "default": 50,
+                "description": "Max files to download (max 200)",
+            },
+            "media_type": {
+                "type": "string",
+                "enum": ["photo", "document", "all"],
+                "default": "photo",
+                "description": "Type of media to download",
+            },
+            "output_dir": {
+                "type": "string",
+                "description": "Output directory (defaults to ~/.telegram-mcp/downloads/)",
+            },
+        },
+        required=["chat_id"],
     ),
     _tool(
         "send_file",
@@ -425,6 +472,27 @@ TOOLS = [
     ),
     _tool("clear_cache", "Wipe the local message cache", {}),
     _tool(
+        "sync_messages",
+        "Sync messages from all chats (or a specific chat) into the local SQLite cache"
+        " for fast offline search and analytics",
+        {
+            "chat_id": {
+                "type": ["integer", "string"],
+                "description": "Optional: sync only this chat. Omit to sync all.",
+            },
+            "limit": {
+                "type": "integer",
+                "default": 1000,
+                "description": "Max messages per chat (default 1000, max 5000)",
+            },
+            "max_chats": {
+                "type": "integer",
+                "default": 50,
+                "description": "Max chats to sync when syncing all (default 50)",
+            },
+        },
+    ),
+    _tool(
         "get_new_messages",
         "Get messages newer than a timestamp (polling pattern for real-time awareness)",
         {
@@ -439,6 +507,93 @@ TOOLS = [
             "limit": {"type": "integer", "default": 50},
         },
         required=["since"],
+    ),
+    _tool(
+        "chat_analytics",
+        "Get analytics from cached messages: top senders by message count",
+        {
+            "chat_id": {
+                "type": ["integer", "string"],
+                "description": "Optional: scope to a specific chat",
+            },
+            "limit": {
+                "type": "integer",
+                "default": 20,
+                "description": "Max senders to return",
+            },
+            "after": {
+                "type": "string",
+                "description": "ISO datetime — only count messages after this time",
+            },
+            "before": {
+                "type": "string",
+                "description": "ISO datetime — only count messages before this time",
+            },
+        },
+    ),
+    _tool(
+        "message_timeline",
+        "Get message counts grouped by time period (hour or day) from the local cache",
+        {
+            "chat_id": {
+                "type": ["integer", "string"],
+                "description": "Optional: scope to a specific chat",
+            },
+            "granularity": {
+                "type": "string",
+                "enum": ["hour", "day"],
+                "default": "day",
+                "description": "Group by hour or day (default: day)",
+            },
+            "after": {
+                "type": "string",
+                "description": "ISO datetime — only messages after this time",
+            },
+            "before": {
+                "type": "string",
+                "description": "ISO datetime — only messages before this time",
+            },
+        },
+    ),
+    _tool(
+        "today_messages",
+        "Get all messages from today (UTC) from the local cache",
+        {
+            "chat_id": {
+                "type": ["integer", "string"],
+                "description": "Optional: scope to a specific chat",
+            },
+            "limit": {
+                "type": "integer",
+                "default": 200,
+                "description": "Max messages to return",
+            },
+        },
+    ),
+    _tool(
+        "export_cached_messages",
+        "Export messages from the local cache as JSON or CSV, with optional filters",
+        {
+            "chat_id": {
+                "type": ["integer", "string"],
+                "description": "Optional: export only this chat",
+            },
+            "limit": {"type": "integer", "default": 5000},
+            "after": {
+                "type": "string",
+                "description": "ISO datetime — only messages after this time",
+            },
+            "before": {
+                "type": "string",
+                "description": "ISO datetime — only messages before this time",
+            },
+            "format": {
+                "type": "string",
+                "enum": ["json", "csv"],
+                "default": "json",
+                "description": "Export format (default: json)",
+            },
+        },
     ),
 ]
 
@@ -508,7 +663,8 @@ def login_cmd():
     """Authenticate with Telegram."""
     from telegram_mcp.login import login_command
 
-    login_command.main(standalone_mode=False)
+    ctx = click.Context(login_command)
+    ctx.invoke(login_command)
 
 
 if __name__ == "__main__":
