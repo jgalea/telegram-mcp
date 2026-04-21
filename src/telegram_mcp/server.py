@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
+import errno
 import json
+import logging
+import os
+import signal
+import time
 from typing import Any
 
 import click
@@ -12,6 +18,64 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from telegram_mcp.client import TelegramMCPClient
+from telegram_mcp.login import CONFIG_DIR
+
+logger = logging.getLogger(__name__)
+
+PIDFILE = os.path.join(CONFIG_DIR, "telegram-mcp.pid")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        return e.errno == errno.EPERM
+    return True
+
+
+def _claim_singleton() -> None:
+    """Ensure only one telegram-mcp serve process is running.
+
+    If a previous instance is still alive (common after Claude Code's /mcp
+    reconnect, which spawns a new process without stopping the old one), kill
+    it — otherwise both fight over the Telethon session SQLite and every
+    write fails with "database is locked".
+    """
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    try:
+        with open(PIDFILE) as f:
+            old_pid = int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        old_pid = None
+
+    if old_pid and old_pid != os.getpid() and _pid_alive(old_pid):
+        logger.warning("Stale telegram-mcp serve (pid=%d) detected; terminating", old_pid)
+        try:
+            os.kill(old_pid, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(20):  # up to 2s
+            if not _pid_alive(old_pid):
+                break
+            time.sleep(0.1)
+        if _pid_alive(old_pid):
+            try:
+                os.kill(old_pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    def _cleanup() -> None:
+        try:
+            with open(PIDFILE) as f:
+                if int(f.read().strip()) == os.getpid():
+                    os.unlink(PIDFILE)
+        except (FileNotFoundError, ValueError, OSError):
+            pass
+
+    atexit.register(_cleanup)
 
 app = Server("telegram-mcp")
 _client: TelegramMCPClient | None = None
@@ -643,6 +707,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 async def serve() -> None:
     """Start the MCP server on stdio."""
     global _client
+    _claim_singleton()
     _client = TelegramMCPClient()
     await _client.connect()
 
