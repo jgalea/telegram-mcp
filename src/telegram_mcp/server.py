@@ -1,15 +1,18 @@
-"""MCP server — tool definitions and stdio entry point."""
+"""MCP server — tool definitions and stdio entry point.
+
+The serve command runs as a thin stdio→Unix-socket proxy. All tool calls are
+forwarded to a single shared daemon process (telegram_mcp.daemon) which owns
+the Telethon session and SQLite cache. Multiple Claude Code sessions can each
+run their own proxy without contending for the SQLite session file.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import atexit
-import errno
 import json
 import logging
-import os
-import signal
-import time
+import subprocess
+import sys
 from typing import Any
 
 import click
@@ -17,68 +20,82 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from telegram_mcp.client import TelegramMCPClient
-from telegram_mcp.login import CONFIG_DIR
+from telegram_mcp.daemon import SOCKET_PATH
 
 logger = logging.getLogger(__name__)
 
-PIDFILE = os.path.join(CONFIG_DIR, "telegram-mcp.pid")
 
+def _spawn_daemon() -> None:
+    """Launch a detached daemon process.
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError as e:
-        return e.errno == errno.EPERM
-    return True
-
-
-def _claim_singleton() -> None:
-    """Ensure only one telegram-mcp serve process is running.
-
-    If a previous instance is still alive (common after Claude Code's /mcp
-    reconnect, which spawns a new process without stopping the old one), kill
-    it — otherwise both fight over the Telethon session SQLite and every
-    write fails with "database is locked".
+    Uses start_new_session=True so the child survives the proxy's exit. If a
+    daemon is already running, the new process will fail the singleton flock
+    in serve_daemon() and exit harmlessly.
     """
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    try:
-        with open(PIDFILE) as f:
-            old_pid = int(f.read().strip())
-    except (FileNotFoundError, ValueError):
-        old_pid = None
+    cmd = [sys.argv[0], "daemon"]
+    subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
 
-    if old_pid and old_pid != os.getpid() and _pid_alive(old_pid):
-        logger.warning("Stale telegram-mcp serve (pid=%d) detected; terminating", old_pid)
+
+async def _ensure_daemon_ready(timeout: float = 8.0) -> None:
+    """Make sure the daemon socket accepts a connection; spawn if needed."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    spawned = False
+    while True:
         try:
-            os.kill(old_pid, signal.SIGTERM)
-        except OSError:
-            pass
-        for _ in range(20):  # up to 2s
-            if not _pid_alive(old_pid):
-                break
-            time.sleep(0.1)
-        if _pid_alive(old_pid):
+            reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
+            writer.close()
             try:
-                os.kill(old_pid, signal.SIGKILL)
-            except OSError:
+                await writer.wait_closed()
+            except Exception:
                 pass
+            return
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            if not spawned:
+                _spawn_daemon()
+                spawned = True
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ConnectionError(
+                    f"telegram-mcp daemon did not become ready within {timeout}s: {e}"
+                ) from e
+            await asyncio.sleep(0.1)
 
-    with open(PIDFILE, "w") as f:
-        f.write(str(os.getpid()))
 
-    def _cleanup() -> None:
+async def _call_daemon(tool: str, args: dict[str, Any], timeout: float = 120.0) -> Any:
+    """Send one request to the daemon, return the parsed response payload."""
+    try:
+        reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
+    except (FileNotFoundError, ConnectionRefusedError):
+        await _ensure_daemon_ready()
+        reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
+
+    try:
+        payload = json.dumps({"id": 1, "tool": tool, "args": args}, default=str)
+        writer.write(payload.encode("utf-8") + b"\n")
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        if not line:
+            raise ConnectionError("daemon closed connection without responding")
+        response = json.loads(line.decode("utf-8"))
+    finally:
+        writer.close()
         try:
-            with open(PIDFILE) as f:
-                if int(f.read().strip()) == os.getpid():
-                    os.unlink(PIDFILE)
-        except (FileNotFoundError, ValueError, OSError):
+            await writer.wait_closed()
+        except Exception:
             pass
 
-    atexit.register(_cleanup)
+    if "error" in response:
+        raise RuntimeError(response["error"])
+    return response.get("result")
+
 
 app = Server("telegram-mcp")
-_client: TelegramMCPClient | None = None
 
 # --- Tool tier classification ---
 
@@ -191,8 +208,18 @@ TOOLS = [
     ),
     _tool(
         "mark_read",
-        "Mark a chat as read",
-        {"chat_id": {"type": ["integer", "string"]}},
+        "Mark a chat as read. For forum supergroups, pass topic_id (1 for the"
+        " General topic) to also clear the per-topic unread cursor.",
+        {
+            "chat_id": {"type": ["integer", "string"]},
+            "topic_id": {
+                "type": "integer",
+                "description": (
+                    "Forum topic root message ID. Pass 1 for the General topic."
+                    " Required to clear the topic badge in forum supergroups."
+                ),
+            },
+        },
         required=["chat_id"],
     ),
     # Messages: Read
@@ -669,11 +696,6 @@ async def list_tools() -> list[Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    global _client
-    if _client is None:
-        return _error("Not connected. Server failed to initialize.")
-
-    # Destructive tool gate
     if name in DESTRUCTIVE_TOOLS and not arguments.get("confirm"):
         return _text(
             {
@@ -685,37 +707,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             }
         )
 
+    args = {k: v for k, v in arguments.items() if k != "confirm"}
     try:
-        await _client.ensure_connected()
-
-        method = getattr(_client, name, None)
-        if method is None:
-            return _error(f"Unknown tool: {name}")
-
-        # Remove 'confirm' from args before passing to client
-        args = {k: v for k, v in arguments.items() if k != "confirm"}
-        result = await asyncio.wait_for(method(**args), timeout=120)
+        result = await asyncio.wait_for(_call_daemon(name, args), timeout=120)
         return _text(result)
     except asyncio.TimeoutError:
         return _error(f"Tool '{name}' timed out after 120 seconds")
-    except ConnectionError as e:
-        return _error(str(e))
     except Exception as e:
         return _error(str(e))
 
 
 async def serve() -> None:
-    """Start the MCP server on stdio."""
-    global _client
-    _claim_singleton()
-    _client = TelegramMCPClient()
-    await _client.connect()
-
-    try:
-        async with stdio_server() as (read_stream, write_stream):
-            await app.run(read_stream, write_stream, app.create_initialization_options())
-    finally:
-        await _client.disconnect()
+    """Start the MCP stdio proxy. Spawns the daemon if it isn't already up."""
+    await _ensure_daemon_ready()
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(read_stream, write_stream, app.create_initialization_options())
 
 
 @click.group()
@@ -725,8 +731,21 @@ def main_cli():
 
 @main_cli.command("serve")
 def serve_cmd():
-    """Start the MCP server on stdio."""
+    """Start the MCP stdio proxy (forwards to the shared daemon)."""
     asyncio.run(serve())
+
+
+@main_cli.command("daemon")
+def daemon_cmd():
+    """Run the long-lived Telethon daemon in the foreground."""
+    from telegram_mcp.daemon import AlreadyRunningError, serve_daemon
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        asyncio.run(serve_daemon())
+    except AlreadyRunningError as e:
+        click.echo(f"telegram-mcp daemon: {e}", err=True)
+        sys.exit(0)
 
 
 @main_cli.command("login")

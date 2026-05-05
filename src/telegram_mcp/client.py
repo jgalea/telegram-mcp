@@ -295,12 +295,35 @@ class TelegramMCPClient:
         await self._client.delete_dialog(entity)
         return {"status": "deleted"}
 
-    async def mark_read(self, chat_id: int | str) -> dict[str, str]:
+    async def mark_read(
+        self, chat_id: int | str, topic_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Mark a chat (and optionally a forum topic) as read.
+
+        Forum supergroups maintain a separate per-topic read cursor that the
+        chat-level send_read_acknowledge does NOT clear. Pass topic_id=1 for
+        the General topic (e.g. GLC's "Lounge"), or the topic root msg_id for
+        any other forum topic.
+        """
         self._rl_write.acquire()
         chat_id = validate_chat_id(chat_id)
         entity = await self._client.get_entity(chat_id)
+
         await self._client.send_read_acknowledge(entity)
-        return {"status": "marked_read"}
+        result: dict[str, Any] = {"status": "marked_read"}
+
+        if topic_id is not None:
+            from telethon.tl.functions.messages import ReadDiscussionRequest
+            peer = await self._client.get_input_entity(chat_id)
+            latest = await self._client.get_messages(entity, limit=1)
+            max_id = latest[0].id if latest else 0
+            await self._client(ReadDiscussionRequest(
+                peer=peer, msg_id=int(topic_id), read_max_id=max_id,
+            ))
+            result["topic_id"] = int(topic_id)
+            result["read_max_id"] = max_id
+
+        return result
 
     # --- Messages: Read ---
 
