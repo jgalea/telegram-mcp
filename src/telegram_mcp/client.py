@@ -616,6 +616,7 @@ class TelegramMCPClient:
 
     async def send_file(
         self, chat_id: int | str, file_path: str, caption: str = "",
+        topic_id: int | None = None, reply_to: int | None = None,
     ) -> dict[str, Any]:
         self._rl_write.acquire()
         chat_id = validate_chat_id(chat_id)
@@ -625,7 +626,14 @@ class TelegramMCPClient:
             )
         if not os.path.exists(file_path):
             raise ValueError(f"File not found: {file_path}")
-        msg = await self._client.send_file(chat_id, file_path, caption=caption)
+        send_reply_to: int | None = reply_to
+        if topic_id is not None and reply_to is None:
+            send_reply_to = int(topic_id)
+        elif reply_to is not None:
+            send_reply_to = int(reply_to)
+        msg = await self._client.send_file(
+            chat_id, file_path, caption=caption, reply_to=send_reply_to,
+        )
         return _msg_to_dict(msg)
 
     async def send_voice(self, chat_id: int | str, file_path: str) -> dict[str, Any]:

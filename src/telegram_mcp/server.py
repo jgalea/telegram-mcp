@@ -440,11 +440,22 @@ TOOLS = [
     ),
     _tool(
         "send_file",
-        "Send a file or photo to a chat",
+        "Send a file or photo to a chat. For forum supergroups, pass topic_id "
+        "to post into a specific topic (1 for the General topic). Combine with "
+        "reply_to to reply to a specific message within that topic.",
         {
             "chat_id": {"type": ["integer", "string"]},
             "file_path": {"type": "string"},
             "caption": {"type": "string", "default": ""},
+            "topic_id": {
+                "type": "integer",
+                "description": "Forum topic root message ID. Use 1 for General. "
+                "Required to target a specific topic in a forum supergroup.",
+            },
+            "reply_to": {
+                "type": "integer",
+                "description": "Reply to a specific message ID.",
+            },
         },
         required=["chat_id", "file_path"],
     ),
