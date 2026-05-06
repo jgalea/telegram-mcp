@@ -330,6 +330,7 @@ class TelegramMCPClient:
     async def read_messages(
         self, chat_id: int | str, limit: int = 20,
         offset_date: str | None = None, from_user: int | str | None = None,
+        topic_id: int | None = None,
     ) -> list[dict[str, Any]]:
         self._rl_fetch.acquire()
         chat_id = validate_chat_id(chat_id)
@@ -338,6 +339,8 @@ class TelegramMCPClient:
             kwargs["offset_date"] = datetime.fromisoformat(offset_date)
         if from_user:
             kwargs["from_user"] = from_user
+        if topic_id is not None:
+            kwargs["reply_to"] = int(topic_id)
 
         messages = await self._client.get_messages(chat_id, **kwargs)
         result = [_msg_to_dict(m) for m in messages if isinstance(m, Message)]
@@ -444,13 +447,24 @@ class TelegramMCPClient:
     async def send_message(
         self, chat_id: int | str, text: str,
         reply_to: int | None = None,
+        topic_id: int | None = None,
         parse_mode: str | None = None,
     ) -> dict[str, Any]:
+        """Send a message. Combine reply_to + topic_id to reply within a topic."""
         self._rl_write.acquire()
         chat_id = validate_chat_id(chat_id)
         validate_message_length(text)
+
+        send_reply_to: Any = reply_to
+        if topic_id is not None:
+            from telethon.tl.types import InputReplyToMessage
+            send_reply_to = InputReplyToMessage(
+                reply_to_msg_id=int(reply_to) if reply_to is not None else int(topic_id),
+                top_msg_id=int(topic_id),
+            )
+
         msg = await self._client.send_message(
-            chat_id, text, reply_to=reply_to, parse_mode=parse_mode,
+            chat_id, text, reply_to=send_reply_to, parse_mode=parse_mode,
         )
         return _msg_to_dict(msg)
 
@@ -753,6 +767,41 @@ class TelegramMCPClient:
             channel=entity, photo=InputChatUploadedPhoto(file=photo)
         ))
         return {"status": "updated"}
+
+    async def list_forum_topics(
+        self, chat_id: int | str, limit: int = 100, query: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List topics in a forum supergroup.
+
+        The General topic is always topic id 1 even though it has no
+        explicit ForumTopic entry returned by the API.
+        """
+        self._rl_fetch.acquire()
+        chat_id = validate_chat_id(chat_id)
+        from telethon.tl.functions.messages import GetForumTopicsRequest
+        peer = await self._client.get_input_entity(chat_id)
+        result = await self._client(GetForumTopicsRequest(
+            peer=peer,
+            offset_date=None,
+            offset_id=0,
+            offset_topic=0,
+            limit=min(limit, 100),
+            q=query,
+        ))
+        topics: list[dict[str, Any]] = []
+        for t in result.topics:
+            if not hasattr(t, "title"):
+                continue  # ForumTopicDeleted has only id
+            topics.append({
+                "id": t.id,
+                "title": fence(t.title, "title"),
+                "top_message": t.top_message,
+                "unread_count": t.unread_count,
+                "closed": bool(getattr(t, "closed", False)),
+                "pinned": bool(getattr(t, "pinned", False)),
+                "hidden": bool(getattr(t, "hidden", False)),
+            })
+        return topics
 
     async def get_invite_link(self, chat_id: int | str) -> dict[str, str]:
         self._rl_fetch.acquire()

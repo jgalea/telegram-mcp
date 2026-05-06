@@ -225,12 +225,17 @@ TOOLS = [
     # Messages: Read
     _tool(
         "read_messages",
-        "Get recent messages from a chat",
+        "Get recent messages from a chat. For forum supergroups, pass topic_id"
+        " to scope to a single topic (use 1 for the General topic).",
         {
             "chat_id": {"type": ["integer", "string"]},
             "limit": {"type": "integer", "default": 20},
             "offset_date": {"type": "string", "description": "ISO date to read before"},
             "from_user": {"type": ["integer", "string"]},
+            "topic_id": {
+                "type": "integer",
+                "description": "Forum topic root message ID. Use 1 for General.",
+            },
         },
         required=["chat_id"],
     ),
@@ -298,11 +303,23 @@ TOOLS = [
     # Messages: Write
     _tool(
         "send_message",
-        "Send a message to a chat (supports reply-to for forum topics)",
+        "Send a message to a chat. For forum supergroups, pass topic_id to post"
+        " into a specific topic (1 for the General topic). Combine with reply_to"
+        " to reply to a specific message within that topic.",
         {
             "chat_id": {"type": ["integer", "string"]},
             "text": {"type": "string"},
-            "reply_to": {"type": "integer"},
+            "reply_to": {
+                "type": "integer",
+                "description": "Reply to a specific message ID.",
+            },
+            "topic_id": {
+                "type": "integer",
+                "description": (
+                    "Forum topic root message ID. Use 1 for General. Required to"
+                    " target a specific topic in a forum supergroup."
+                ),
+            },
             "parse_mode": {
                 "type": "string",
                 "enum": ["md", "html"],
@@ -532,6 +549,17 @@ TOOLS = [
             "file_path": {"type": "string"},
         },
         required=["chat_id", "file_path"],
+    ),
+    _tool(
+        "list_forum_topics",
+        "List topics in a forum supergroup (e.g. GLC). Returns id, title,"
+        " unread_count, and flags per topic. The General topic is always id 1.",
+        {
+            "chat_id": {"type": ["integer", "string"]},
+            "limit": {"type": "integer", "default": 100, "description": "Max topics (cap 100)"},
+            "query": {"type": "string", "description": "Optional title substring filter."},
+        },
+        required=["chat_id"],
     ),
     _tool(
         "get_invite_link",

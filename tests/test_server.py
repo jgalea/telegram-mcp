@@ -5,7 +5,7 @@ from telegram_mcp.server import DESTRUCTIVE_TOOLS, TOOLS
 
 class TestToolRegistration:
     def test_tool_count(self):
-        assert len(TOOLS) == 53
+        assert len(TOOLS) == 54
 
     def test_all_tools_have_names(self):
         for tool in TOOLS:
