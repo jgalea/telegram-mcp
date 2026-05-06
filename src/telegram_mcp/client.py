@@ -455,13 +455,11 @@ class TelegramMCPClient:
         chat_id = validate_chat_id(chat_id)
         validate_message_length(text)
 
-        send_reply_to: Any = reply_to
-        if topic_id is not None:
-            from telethon.tl.types import InputReplyToMessage
-            send_reply_to = InputReplyToMessage(
-                reply_to_msg_id=int(reply_to) if reply_to is not None else int(topic_id),
-                top_msg_id=int(topic_id),
-            )
+        send_reply_to: int | None = reply_to
+        if topic_id is not None and reply_to is None:
+            send_reply_to = int(topic_id)
+        elif reply_to is not None:
+            send_reply_to = int(reply_to)
 
         msg = await self._client.send_message(
             chat_id, text, reply_to=send_reply_to, parse_mode=parse_mode,

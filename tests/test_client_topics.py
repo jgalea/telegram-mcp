@@ -90,9 +90,7 @@ class TestListForumTopics:
 
 
 class TestSendMessageWithTopic:
-    async def test_send_with_topic_id_sets_top_msg_id(self, client):
-        from telethon.tl.types import InputReplyToMessage
-
+    async def test_send_with_topic_id_passes_topic_as_reply_to(self, client):
         sent_msg = MagicMock()
         sent_msg.id = 999
         sent_msg.chat_id = -100
@@ -108,14 +106,9 @@ class TestSendMessageWithTopic:
 
         client._client.send_message.assert_awaited_once()
         kwargs = client._client.send_message.call_args.kwargs
-        reply_arg = kwargs["reply_to"]
-        assert isinstance(reply_arg, InputReplyToMessage)
-        assert reply_arg.top_msg_id == 1
-        assert reply_arg.reply_to_msg_id == 1
+        assert kwargs["reply_to"] == 1
 
-    async def test_send_with_topic_id_and_reply_to_replies_within_topic(self, client):
-        from telethon.tl.types import InputReplyToMessage
-
+    async def test_send_with_topic_id_and_reply_to_uses_specific_msg(self, client):
         sent_msg = MagicMock()
         sent_msg.id = 1000
         sent_msg.chat_id = -100
@@ -130,10 +123,7 @@ class TestSendMessageWithTopic:
         await client.send_message(1266974497, "reply", reply_to=42, topic_id=5)
 
         kwargs = client._client.send_message.call_args.kwargs
-        reply_arg = kwargs["reply_to"]
-        assert isinstance(reply_arg, InputReplyToMessage)
-        assert reply_arg.top_msg_id == 5
-        assert reply_arg.reply_to_msg_id == 42
+        assert kwargs["reply_to"] == 42
 
     async def test_send_without_topic_id_passes_plain_int(self, client):
         sent_msg = MagicMock()
