@@ -115,15 +115,91 @@ class TestHandleRequest:
         client = MagicMock()
         client.ensure_connected = AsyncMock()
 
-        async def takes_one_arg(x):
-            return x
+        async def takes_no_args():
+            return None
 
-        client.something = takes_one_arg
+        # list_chats is in the whitelist; the bad kwarg makes it raise TypeError
+        client.list_chats = takes_no_args
         result = await daemon._handle_request(
-            client, {"id": 5, "tool": "something", "args": {"wrong_kwarg": 1}}
+            client, {"id": 5, "tool": "list_chats", "args": {"wrong_kwarg": 1}}
         )
         assert result["id"] == 5
         assert "bad args" in result["error"]
+
+
+class TestWhitelist:
+    """The whitelist must reject any tool name not registered in TOOLS,
+    even if it would resolve via getattr on the real client."""
+
+    async def test_private_method_rejected(self):
+        client = MagicMock()
+        client.ensure_connected = AsyncMock()
+        client._cache_messages = MagicMock()
+        client.disconnect = AsyncMock()
+        client.connect = AsyncMock()
+        client._start_listener = MagicMock()
+
+        for private in ("_cache_messages", "disconnect", "connect", "_start_listener"):
+            result = await daemon._handle_request(
+                client, {"id": 1, "tool": private, "args": {}}
+            )
+            assert "unknown tool" in result["error"], f"{private} should be rejected"
+
+        # None of the lifecycle methods were ever invoked
+        client._cache_messages.assert_not_called()
+        client.disconnect.assert_not_awaited()
+        client.connect.assert_not_awaited()
+        client._start_listener.assert_not_called()
+
+    async def test_dunder_methods_rejected(self):
+        client = MagicMock()
+        client.ensure_connected = AsyncMock()
+        result = await daemon._handle_request(
+            client, {"id": 1, "tool": "__class__", "args": {}}
+        )
+        assert "unknown tool" in result["error"]
+
+
+class TestDestructiveGate:
+    async def test_destructive_without_confirm_returns_warning(self):
+        client = MagicMock()
+        client.ensure_connected = AsyncMock()
+        client.delete_chat = AsyncMock()
+
+        result = await daemon._handle_request(
+            client, {"id": 5, "tool": "delete_chat", "args": {"chat_id": 123}}
+        )
+        # Warning is returned as a successful result, not an error
+        assert "error" not in result
+        assert "warning" in result["result"]
+        assert "destructive" in result["result"]["warning"].lower()
+        client.delete_chat.assert_not_awaited()
+
+    async def test_destructive_with_confirm_strips_and_dispatches(self):
+        client = MagicMock()
+        client.ensure_connected = AsyncMock()
+        client.delete_chat = AsyncMock(return_value={"status": "deleted"})
+
+        result = await daemon._handle_request(
+            client,
+            {"id": 6, "tool": "delete_chat", "args": {"chat_id": 123, "confirm": True}},
+        )
+        assert result["result"] == {"status": "deleted"}
+        client.delete_chat.assert_awaited_once_with(chat_id=123)
+
+    async def test_non_destructive_passes_confirm_through_stripped(self):
+        """A confirm flag on a non-destructive tool should be stripped silently
+        so it never reaches the underlying method (which doesn't accept it)."""
+        client = MagicMock()
+        client.ensure_connected = AsyncMock()
+        client.list_chats = AsyncMock(return_value=[])
+
+        result = await daemon._handle_request(
+            client,
+            {"id": 7, "tool": "list_chats", "args": {"limit": 5, "confirm": True}},
+        )
+        assert result["result"] == []
+        client.list_chats.assert_awaited_once_with(limit=5)
 
 
 @pytest.fixture

@@ -1,6 +1,7 @@
 """Test that all tools are registered and well-formed."""
 
-from telegram_mcp.server import DESTRUCTIVE_TOOLS, TOOLS
+from telegram_mcp._registry import DESTRUCTIVE_TOOLS
+from telegram_mcp.server import TOOLS
 
 
 class TestToolRegistration:

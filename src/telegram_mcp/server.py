@@ -20,6 +20,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from telegram_mcp._registry import DESTRUCTIVE_TOOLS
 from telegram_mcp.daemon import SOCKET_PATH
 
 logger = logging.getLogger(__name__)
@@ -96,17 +97,6 @@ async def _call_daemon(tool: str, args: dict[str, Any], timeout: float = 120.0) 
 
 
 app = Server("telegram-mcp")
-
-# --- Tool tier classification ---
-
-DESTRUCTIVE_TOOLS = {
-    "delete_chat",
-    "leave_chat",
-    "block_user",
-    "remove_participant",
-    "delete_message",
-    "forward_message",
-}
 
 
 def _tool(
@@ -735,20 +725,8 @@ async def list_tools() -> list[Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    if name in DESTRUCTIVE_TOOLS and not arguments.get("confirm"):
-        return _text(
-            {
-                "warning": (
-                    f"'{name}' is a destructive action. "
-                    "Call again with confirm=true to proceed."
-                ),
-                "would_do": f"Execute {name} with args: {arguments}",
-            }
-        )
-
-    args = {k: v for k, v in arguments.items() if k != "confirm"}
     try:
-        result = await asyncio.wait_for(_call_daemon(name, args), timeout=120)
+        result = await asyncio.wait_for(_call_daemon(name, arguments), timeout=120)
         return _text(result)
     except asyncio.TimeoutError:
         return _error(f"Tool '{name}' timed out after 120 seconds")

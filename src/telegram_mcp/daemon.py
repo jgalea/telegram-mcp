@@ -27,6 +27,7 @@ import os
 import signal
 from typing import Any
 
+from telegram_mcp._registry import DESTRUCTIVE_TOOLS
 from telegram_mcp.client import TelegramMCPClient
 from telegram_mcp.login import CONFIG_DIR
 
@@ -34,6 +35,22 @@ logger = logging.getLogger(__name__)
 
 SOCKET_PATH = os.path.join(CONFIG_DIR, "daemon.sock")
 LOCK_PATH = os.path.join(CONFIG_DIR, "daemon.lock")
+
+_ALLOWED_TOOLS_CACHE: frozenset[str] | None = None
+
+
+def _allowed_tools() -> frozenset[str]:
+    """Return the set of tool names exposed by the MCP.
+
+    Lazy-imported to avoid the circular dependency with server.py (which
+    imports SOCKET_PATH from this module). Caching keeps the per-request
+    cost negligible.
+    """
+    global _ALLOWED_TOOLS_CACHE
+    if _ALLOWED_TOOLS_CACHE is None:
+        from telegram_mcp.server import TOOLS  # noqa: PLC0415 — intentional
+        _ALLOWED_TOOLS_CACHE = frozenset(t.name for t in TOOLS)
+    return _ALLOWED_TOOLS_CACHE
 
 
 class AlreadyRunningError(RuntimeError):
@@ -69,7 +86,20 @@ def _remove_stale_socket() -> None:
 
 
 async def _handle_request(client: TelegramMCPClient, payload: dict[str, Any]) -> dict[str, Any]:
-    """Dispatch a single {tool, args} payload to the underlying client."""
+    """Dispatch a single {tool, args} payload to the underlying client.
+
+    Two safety gates run before getattr-based dispatch:
+
+      1. Whitelist: tool name must appear in the registered TOOLS list.
+         Without this, any TelegramMCPClient method would be callable —
+         including private ones like _cache_messages (cache poisoning) or
+         disconnect (denies service to every concurrent proxy).
+
+      2. Destructive-tool confirm: tools that mutate or destroy state
+         require an explicit confirm=True flag. Lives here (not just in
+         the proxy) so a caller speaking the socket protocol directly
+         cannot bypass the safety gate.
+    """
     req_id = payload.get("id")
     tool = payload.get("tool")
     args = payload.get("args") or {}
@@ -79,13 +109,30 @@ async def _handle_request(client: TelegramMCPClient, payload: dict[str, Any]) ->
     if not isinstance(args, dict):
         return {"id": req_id, "error": "'args' must be an object"}
 
+    if tool not in _allowed_tools():
+        return {"id": req_id, "error": f"unknown tool: {tool}"}
+
+    if tool in DESTRUCTIVE_TOOLS and not args.get("confirm"):
+        return {
+            "id": req_id,
+            "result": {
+                "warning": (
+                    f"'{tool}' is a destructive action. "
+                    "Call again with confirm=true to proceed."
+                ),
+                "would_do": f"Execute {tool} with args: {args}",
+            },
+        }
+
     method = getattr(client, tool, None)
     if method is None or not callable(method):
         return {"id": req_id, "error": f"unknown tool: {tool}"}
 
+    call_args = {k: v for k, v in args.items() if k != "confirm"}
+
     try:
         await client.ensure_connected()
-        result = await method(**args)
+        result = await method(**call_args)
         return {"id": req_id, "result": result}
     except TypeError as e:
         return {"id": req_id, "error": f"bad args for {tool}: {e}"}
