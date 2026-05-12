@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
 from typing import Any
@@ -32,20 +33,38 @@ def _spawn_daemon() -> None:
     Uses start_new_session=True so the child survives the proxy's exit. If a
     daemon is already running, the new process will fail the singleton flock
     in serve_daemon() and exit harmlessly.
+
+    Daemon stdout+stderr are appended to ~/.telegram-mcp/daemon.log so crashes
+    during Telethon connect are diagnosable. Without this, a daemon that died
+    on startup left no trace and looked indistinguishable from "server fine".
     """
-    cmd = [sys.argv[0], "daemon"]
-    subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
+    from telegram_mcp.login import CONFIG_DIR  # noqa: PLC0415
+
+    log_path = os.path.join(CONFIG_DIR, "daemon.log")
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        cmd = [sys.argv[0], "daemon"]
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fd,
+            stderr=log_fd,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        os.close(log_fd)
 
 
-async def _ensure_daemon_ready(timeout: float = 8.0) -> None:
-    """Make sure the daemon socket accepts a connection; spawn if needed."""
+async def _ensure_daemon_ready(timeout: float = 30.0) -> None:
+    """Make sure the daemon socket accepts a connection; spawn if needed.
+
+    Cold-start can be slow: the daemon has to do Telethon's DC discovery and
+    auth-key exchange before it binds the socket. On flaky networks this
+    sometimes runs 10s+. The timeout is generous so a slow first connect
+    doesn't kill the proxy.
+    """
     deadline = asyncio.get_running_loop().time() + timeout
     spawned = False
     while True:
@@ -729,10 +748,23 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 
 async def serve() -> None:
-    """Start the MCP stdio proxy. Spawns the daemon if it isn't already up."""
-    await _ensure_daemon_ready()
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+    """Start the MCP stdio proxy.
+
+    The MCP `initialize` handshake doesn't need the daemon — it just answers
+    capability questions. We let the daemon spawn lazily on the first tool
+    call so a slow Telegram cold start can't kill the proxy and cause Claude
+    to mark the server unavailable.
+    """
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(read_stream, write_stream, app.create_initialization_options())
+    except Exception:
+        # Surface the failure so Claude shows the real error rather than just
+        # a dead-server red dot. logging isn't configured for the proxy, so
+        # write directly to stderr.
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        raise
 
 
 @click.group()

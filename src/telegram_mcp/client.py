@@ -111,7 +111,19 @@ class TelegramMCPClient:
         if not self._api_id or not self._api_hash:
             raise RuntimeError("Not configured. Run 'telegram-mcp login' first.")
 
-        self._client = TelegramClient(SESSION_PATH, self._api_id, self._api_hash)
+        # Explicit connection params so behaviour doesn't drift with Telethon
+        # releases. The daemon is long-running, so we want generous retries
+        # and a longer per-request timeout for flaky networks.
+        self._client = TelegramClient(
+            SESSION_PATH,
+            self._api_id,
+            self._api_hash,
+            timeout=30,
+            request_retries=5,
+            connection_retries=10,
+            retry_delay=2,
+            auto_reconnect=True,
+        )
         self._cache = MessageCache(os.path.join(CONFIG_DIR, "cache.db"))
         self._connected = False
 
