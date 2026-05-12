@@ -1,7 +1,12 @@
 """Test that all tools are registered and well-formed."""
 
+import asyncio
+
+import pytest
+
+from telegram_mcp import server as server_module
 from telegram_mcp._registry import DESTRUCTIVE_TOOLS
-from telegram_mcp.server import TOOLS
+from telegram_mcp.server import TOOLS, call_tool
 
 
 class TestToolRegistration:
@@ -108,3 +113,36 @@ class TestToolRegistration:
     def test_download_chat_media_requires_chat_id(self):
         tool = next(t for t in TOOLS if t.name == "download_chat_media")
         assert "chat_id" in tool.inputSchema.get("required", [])
+
+
+class TestCallToolErrorPropagation:
+    """call_tool must raise, not swallow, so the MCP SDK can flag isError=true.
+
+    If we swallow the exception and return a TextContent with an `error` field,
+    the SDK treats it as a successful tool call. Some Claude sessions then
+    misread or hallucinate around the error instead of surfacing it cleanly.
+    """
+
+    def test_daemon_error_propagates_as_exception(self, monkeypatch):
+        async def fake_call_daemon(tool, args, timeout=120.0):
+            raise RuntimeError("Not authorized. Run 'telegram-mcp login' first.")
+
+        monkeypatch.setattr(server_module, "_call_daemon", fake_call_daemon)
+
+        with pytest.raises(RuntimeError, match="Not authorized"):
+            asyncio.run(call_tool("list_chats", {}))
+
+    def test_timeout_raises_with_named_message(self, monkeypatch):
+        async def hang(tool, args, timeout=120.0):
+            await asyncio.sleep(10)
+
+        monkeypatch.setattr(server_module, "_call_daemon", hang)
+        monkeypatch.setattr(server_module.asyncio, "wait_for", _immediate_timeout)
+
+        with pytest.raises(RuntimeError, match="list_chats.*timed out"):
+            asyncio.run(call_tool("list_chats", {}))
+
+
+async def _immediate_timeout(coro, timeout):
+    coro.close()
+    raise asyncio.TimeoutError

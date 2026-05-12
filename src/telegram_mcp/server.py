@@ -126,10 +126,6 @@ def _text(data: Any) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(data, indent=2, default=str))]
 
 
-def _error(msg: str) -> list[TextContent]:
-    return [TextContent(type="text", text=json.dumps({"error": msg}))]
-
-
 # --- Tool Definitions ---
 
 TOOLS = [
@@ -727,11 +723,9 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     try:
         result = await asyncio.wait_for(_call_daemon(name, arguments), timeout=120)
-        return _text(result)
-    except asyncio.TimeoutError:
-        return _error(f"Tool '{name}' timed out after 120 seconds")
-    except Exception as e:
-        return _error(str(e))
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(f"Tool '{name}' timed out after 120 seconds") from e
+    return _text(result)
 
 
 async def serve() -> None:

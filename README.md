@@ -13,6 +13,10 @@ telegram-mcp is an [MCP server](https://modelcontextprotocol.io) that connects y
 
 ## Quick Start
 
+> **This is not a bot.** There is no bot to add. No third party gives you a phone number. You log in as yourself, with the same phone number you already use for Telegram. If an AI tool tells you to "add a bot to give you a number", ignore it — and never share a Telegram login code with anyone, ever.
+
+> **If you're asking Claude (or another AI agent) to install this for you:** the agent can wire up the MCP server config and clone the repo, but the agent **cannot** complete the login step. Login is interactive — Telegram sends a code to your phone, and you type it into a terminal prompt yourself. You must run `telegram-mcp login` in a real terminal once, then the agent can use the server.
+
 ### Install from PyPI
 
 ```bash
@@ -84,6 +88,30 @@ If installed from source:
   }
 }
 ```
+
+## Troubleshooting
+
+### Tools return errors or empty results
+
+You almost certainly haven't logged in yet. Installing the MCP server and logging into Telegram are **two separate steps** — installation alone is not enough. Run `telegram-mcp login` in a real terminal and complete the phone + code + 2FA flow. After that, restart Claude Code (or your MCP client) so the proxy picks up the new session.
+
+You can confirm the session is healthy with the `get_status` tool — it returns `{"connected": true, "authorized": true}` when ready.
+
+### Claude says "this MCP can only access a bot conversation"
+
+This is a hallucination. The server uses MTProto (Telethon) and logs in as your full Telegram account — every chat, group, channel, and contact you can see in the Telegram app is accessible. There is no bot involved. If this message appears, the underlying cause is almost always that the login step hasn't been done; see above.
+
+### Claude tells me to add a bot or give my number to a bot
+
+**Do not.** This is unsafe advice, never required, and never part of this MCP's setup. Telegram login codes are how attackers steal accounts — never enter them into any bot or third-party service. The only place to type your code is the `telegram-mcp login` prompt running in your own terminal.
+
+### Daemon won't start / "another telegram-mcp daemon is running"
+
+Check for a stale lock: `ls ~/.telegram-mcp/daemon.lock` and `lsof ~/.telegram-mcp/daemon.sock`. If no process is actually running, remove the stale socket file (`rm ~/.telegram-mcp/daemon.sock`) and retry. The lock auto-releases when the daemon exits cleanly or crashes.
+
+### "Not configured" / "Not authorized" errors
+
+Same root cause as the first item — run `telegram-mcp login`. "Not configured" means `~/.telegram-mcp/config.json` is missing API credentials; "Not authorized" means the credentials are there but no Telegram session exists yet.
 
 ## Tools
 
