@@ -2,6 +2,7 @@
 
 import os
 import stat
+from datetime import datetime, timedelta, timezone
 from sqlite3 import ProgrammingError
 
 import pytest
@@ -200,16 +201,16 @@ class TestGetMessageIds:
 class TestPrune:
     def test_prune_removes_old_messages(self, cache):
         """prune() deletes messages older than max_age_days."""
-        # Old message — 90 days ago
+        old = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         cache.cache_message(
             msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
-            text="Old message", date="2025-12-01T10:00:00+00:00",
+            text="Old message", date=old,
             reply_to_id=None, media_type=None, edited=None, raw_json="{}",
         )
-        # Recent message — today
         cache.cache_message(
             msg_id=2, chat_id=100, sender_id=200, sender_name="Alice",
-            text="Recent message", date="2026-03-31T10:00:00+00:00",
+            text="Recent message", date=recent,
             reply_to_id=None, media_type=None, edited=None, raw_json="{}",
         )
         removed = cache.prune(max_age_days=30)
@@ -220,9 +221,10 @@ class TestPrune:
 
     def test_prune_keeps_all_when_none_old(self, cache):
         """prune() with no old messages removes nothing."""
+        fresh = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         cache.cache_message(
             msg_id=1, chat_id=100, sender_id=200, sender_name="Alice",
-            text="Fresh", date="2026-03-31T10:00:00+00:00",
+            text="Fresh", date=fresh,
             reply_to_id=None, media_type=None, edited=None, raw_json="{}",
         )
         removed = cache.prune(max_age_days=30)
