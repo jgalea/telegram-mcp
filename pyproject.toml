@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "telegram-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Telegram MCP server — give AI tools direct access to your Telegram account"
 readme = "README.md"
 license = { file = "LICENSE" }

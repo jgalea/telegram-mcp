@@ -146,3 +146,33 @@ class TestCallToolErrorPropagation:
 async def _immediate_timeout(coro, timeout):
     coro.close()
     raise asyncio.TimeoutError
+
+
+class TestTerminalSignalDetachment:
+    """The stdio proxy must survive terminal job-control signals (SIGHUP on
+    terminal hangup, SIGINT on Ctrl-C). Those reach the proxy only because it
+    shares the harness's controlling-terminal process group; exiting on them is
+    what made the server keep disconnecting when Jean detached zellij, closed
+    the terminal, or interrupted Claude. Genuine shutdown comes via stdin EOF or
+    SIGTERM, which this does not touch.
+    """
+
+    def test_ignores_sighup_and_sigint(self):
+        import signal
+
+        from telegram_mcp.server import _ignore_terminal_signals
+
+        prev = {
+            signal.SIGHUP: signal.getsignal(signal.SIGHUP),
+            signal.SIGINT: signal.getsignal(signal.SIGINT),
+            signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+        }
+        try:
+            _ignore_terminal_signals()
+            assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+            assert signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+            # SIGTERM is the harness's explicit stop -- must stay untouched.
+            assert signal.getsignal(signal.SIGTERM) == prev[signal.SIGTERM]
+        finally:
+            for sig, handler in prev.items():
+                signal.signal(sig, handler)

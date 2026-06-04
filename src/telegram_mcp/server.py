@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 from typing import Any
@@ -772,9 +773,32 @@ def main_cli():
     """telegram-mcp -- Telegram MCP server."""
 
 
+def _ignore_terminal_signals() -> None:
+    """Detach the stdio proxy from terminal job-control signals.
+
+    The harness drives this proxy through the stdio pipe: it stops us by closing
+    stdin (EOF) or sending SIGTERM. SIGHUP (terminal hangup) and SIGINT (Ctrl-C)
+    only reach us because the proxy is spawned inside the harness's
+    controlling-terminal process group -- so detaching zellij, closing the
+    terminal, or interrupting Claude delivers them to us as collateral, not as a
+    request to stop. Python's default disposition kills the process on both,
+    which is what made the server "keep disconnecting". Ignoring them keeps the
+    proxy alive: stdin EOF (guaranteed when the parent goes away) and SIGTERM
+    still shut it down cleanly, and the detached daemon is unaffected.
+    """
+    for sig in (signal.SIGHUP, signal.SIGINT):
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            # Not in the main thread, or platform without the signal -- nothing
+            # to detach from, so serving as-is is fine.
+            pass
+
+
 @main_cli.command("serve")
 def serve_cmd():
     """Start the MCP stdio proxy (forwards to the shared daemon)."""
+    _ignore_terminal_signals()
     asyncio.run(serve())
 
 
