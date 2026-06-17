@@ -1,5 +1,7 @@
 # telegram-mcp
 
+<!-- mcp-name: io.github.jgalea/telegram-mcp -->
+
 Give your AI tools direct access to Telegram. Read chats, send messages, search history, manage groups, download media — all via the Model Context Protocol.
 
 telegram-mcp is an [MCP server](https://modelcontextprotocol.io) that connects your Telegram account to Claude Code, Cursor, Windsurf, or any AI tool that supports MCP. Instead of switching to Telegram, you ask the AI to check your messages, reply to someone, or find that link from last week — and it does.
@@ -20,14 +22,16 @@ telegram-mcp is an [MCP server](https://modelcontextprotocol.io) that connects y
 ### Install from PyPI
 
 ```bash
-uv tool install telegram-mcp
+uv tool install telegram-mcp-jgalea
 ```
 
 Or with pip:
 
 ```bash
-pip install telegram-mcp
+pip install telegram-mcp-jgalea
 ```
+
+Both provide the `telegram-mcp` command.
 
 ### Install from source
 
@@ -308,6 +312,8 @@ Tools are classified by risk level:
 | **Read** | `list_chats`, `read_messages`, `search_messages`, `get_chat_info`, etc. | No restrictions |
 | **Write** | `send_message`, `edit_message`, `send_file`, `pin_message`, etc. | Normal operation |
 | **Destructive** | `delete_chat`, `leave_chat`, `block_user`, `remove_participant`, `delete_message` | Require explicit `confirm: true` parameter. Without it, the tool returns a warning describing what would happen and asks for confirmation. |
+
+**Residual risk worth understanding:** `send_message` and `send_file` are Write-tier, not Destructive, so they don't require `confirm: true` — gating every send would make normal use unworkable. The fencing above is the primary defense, but no prompt-injection defense is perfect. If a crafted message ever defeats the fence, the worst case is the AI sending a message to a chat it shouldn't. Run this only with an AI client you trust, and treat outbound sends as something the model can do autonomously.
 
 ### File operation safety
 

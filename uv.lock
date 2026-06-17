@@ -876,8 +876,8 @@ wheels = [
 ]
 
 [[package]]
-name = "telegram-mcp"
-version = "0.1.1"
+name = "telegram-mcp-jgalea"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "click" },

@@ -63,7 +63,7 @@ def _acquire_singleton_lock() -> int:
     Returns the file descriptor; caller keeps it open for the daemon's lifetime
     so the kernel releases the lock on exit (clean or crash).
     """
-    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -120,7 +120,7 @@ async def _handle_request(client: TelegramMCPClient, payload: dict[str, Any]) ->
                     f"'{tool}' is a destructive action. "
                     "Call again with confirm=true to proceed."
                 ),
-                "would_do": f"Execute {tool} with args: {args}",
+                "would_do": f"Execute {tool} (provide confirm=true to proceed)",
             },
         }
 
@@ -177,7 +177,13 @@ async def serve_daemon() -> None:
     client = TelegramMCPClient()
     await client.connect()
 
-    server = await asyncio.start_unix_server(_make_handler(client), path=SOCKET_PATH)
+    # Create the socket with a restrictive umask so it is never world-accessible,
+    # even briefly, between creation and the chmod below (closes a local-access race).
+    old_umask = os.umask(0o177)
+    try:
+        server = await asyncio.start_unix_server(_make_handler(client), path=SOCKET_PATH)
+    finally:
+        os.umask(old_umask)
     os.chmod(SOCKET_PATH, 0o600)
     logger.info("telegram-mcp daemon listening on %s (pid=%d)", SOCKET_PATH, os.getpid())
 

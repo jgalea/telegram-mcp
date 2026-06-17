@@ -1,0 +1,20 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.jgalea/telegram-mcp",
+  "description": "Telegram MCP server: read, send, and search messages and manage chats via your account.",
+  "repository": {
+    "url": "https://github.com/jgalea/telegram-mcp",
+    "source": "github"
+  },
+  "version": "0.1.2",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "telegram-mcp-jgalea",
+      "version": "0.1.2",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

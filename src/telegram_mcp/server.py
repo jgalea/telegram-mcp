@@ -768,9 +768,16 @@ async def serve() -> None:
         raise
 
 
-@click.group()
-def main_cli():
-    """telegram-mcp -- Telegram MCP server."""
+@click.group(invoke_without_command=True)
+@click.pass_context
+def main_cli(ctx: click.Context):
+    """telegram-mcp -- Telegram MCP server.
+
+    With no subcommand, starts the MCP stdio server (same as ``serve``), so
+    MCP clients can launch the bare ``telegram-mcp`` command.
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(serve_cmd)
 
 
 def _ignore_terminal_signals() -> None:

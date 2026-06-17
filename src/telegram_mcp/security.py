@@ -47,18 +47,23 @@ _FENCE_LABELS: dict[str, tuple[str, str]] = {
     ),
 }
 
+_OPEN_MARKER_RE = re.compile(r"\[TELEGRAM [A-Z ]+\]")
 _END_MARKER_RE = re.compile(r"\[END TELEGRAM [A-Z]+\]")
 
 
-def escape_fence_markers(text: str) -> str:
-    """Escape any ``[END TELEGRAM ...]`` markers found in *text*.
+def _escape_brackets(match: re.Match[str]) -> str:
+    return match.group(0).replace("[", "\\[").replace("]", "\\]")
 
-    This prevents untrusted content from prematurely closing a fence.
+
+def escape_fence_markers(text: str) -> str:
+    """Escape any fence markers found in *text*.
+
+    Both opening (``[TELEGRAM ...]``) and closing (``[END TELEGRAM ...]``)
+    markers are escaped, so untrusted content cannot forge a second opening
+    tag or prematurely close a fence to break out of the block.
     """
-    return _END_MARKER_RE.sub(
-        lambda m: m.group(0).replace("[", "\\[").replace("]", "\\]"),
-        text,
-    )
+    text = _OPEN_MARKER_RE.sub(_escape_brackets, text)
+    return _END_MARKER_RE.sub(_escape_brackets, text)
 
 
 def fence(content: str | None, field_type: str) -> str:
