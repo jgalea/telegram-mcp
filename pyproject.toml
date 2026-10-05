@@ -24,6 +24,7 @@ dependencies = [
     "click>=8.0",
     "cryptg>=0.4",
     "hachoir>=3.3",
+    "regex>=2026.9.29",
 ]
 
 [project.urls]

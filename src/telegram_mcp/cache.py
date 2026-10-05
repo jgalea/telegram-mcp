@@ -7,9 +7,72 @@ Used for local search and deduplication — not a sync engine.
 from __future__ import annotations
 
 import os
-import re
 import sqlite3
+import time
 from datetime import datetime, timezone
+
+import regex
+
+# Columns returned to callers. raw_json is deliberately absent: it holds the
+# original, unfenced text and sender, and must never reach the model.
+_MSG_COLUMNS = (
+    "id, chat_id, sender_id, sender_name, text, date, reply_to_id, media_type, edited"
+)
+
+# Regex search guard rails. Patterns are compiled with the `regex` module,
+# whose matcher enforces a wall-clock timeout per call, so a catastrophic
+# pattern fails fast instead of pinning the daemon.
+REGEX_MAX_PATTERN_LENGTH = 256
+REGEX_MAX_ROWS = 20_000
+REGEX_MATCH_TIMEOUT = 0.25  # seconds per row
+REGEX_TOTAL_BUDGET = 5.0  # seconds per search
+
+
+def compile_search_pattern(pattern: str) -> regex.Pattern:
+    """Compile a user-supplied pattern with the length cap applied."""
+    if len(pattern) > REGEX_MAX_PATTERN_LENGTH:
+        raise ValueError(
+            f"Regex pattern too long ({len(pattern)} chars, max {REGEX_MAX_PATTERN_LENGTH})"
+        )
+    try:
+        return regex.compile(pattern, regex.IGNORECASE)
+    except regex.error as e:
+        raise ValueError(f"Invalid regex pattern: {e}") from e
+
+
+def regex_filter(
+    rows: list[dict],
+    compiled: regex.Pattern,
+    limit: int,
+    match_timeout: float = REGEX_MATCH_TIMEOUT,
+    total_budget: float = REGEX_TOTAL_BUDGET,
+) -> list[dict]:
+    """Return up to *limit* rows whose text matches *compiled*.
+
+    Pure CPU work with no database access, so callers can run it off the
+    event loop. Raises ValueError when a single row exceeds *match_timeout*
+    or the whole scan exceeds *total_budget*.
+    """
+    deadline = time.monotonic() + total_budget
+    results: list[dict] = []
+    for row in rows:
+        if time.monotonic() > deadline:
+            raise ValueError(
+                f"Regex search timed out after {total_budget}s; narrow the pattern or filters"
+            )
+        try:
+            matched = compiled.search(row.get("text") or "", timeout=match_timeout)
+        except TimeoutError:
+            raise ValueError(
+                f"Regex pattern timed out after {match_timeout}s on a single message;"
+                " it is too expensive to run"
+            ) from None
+        if matched:
+            results.append(row)
+            if len(results) >= limit:
+                break
+    return results
+
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS messages (
@@ -94,7 +157,7 @@ class MessageCache:
         limit: int = 50,
     ) -> list[dict]:
         """Search messages by text using LIKE, optionally filtered by chat_id."""
-        sql = "SELECT * FROM messages WHERE text LIKE ?"
+        sql = f"SELECT {_MSG_COLUMNS} FROM messages WHERE text LIKE ?"
         params: list = [f"%{query}%"]
 
         if chat_id is not None:
@@ -107,20 +170,15 @@ class MessageCache:
         rows = self._conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
-    def search_regex(
+    def regex_candidates(
         self,
-        pattern: str,
         chat_id: int | None = None,
-        limit: int = 50,
         after: str | None = None,
         before: str | None = None,
+        max_rows: int = REGEX_MAX_ROWS,
     ) -> list[dict]:
-        """Search cached messages using a Python regex pattern (case-insensitive)."""
-        try:
-            regex = re.compile(pattern, re.IGNORECASE)
-        except re.error as e:
-            raise ValueError(f"Invalid regex pattern: {e}") from e
-        sql = "SELECT * FROM messages WHERE text IS NOT NULL"
+        """Rows eligible for a regex scan, newest first, capped at *max_rows*."""
+        sql = f"SELECT {_MSG_COLUMNS} FROM messages WHERE text IS NOT NULL"
         params: list = []
 
         if chat_id is not None:
@@ -133,17 +191,27 @@ class MessageCache:
             sql += " AND date <= ?"
             params.append(before)
 
-        sql += " ORDER BY date DESC"
+        sql += " ORDER BY date DESC LIMIT ?"
+        params.append(max_rows)
         rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
 
-        results: list[dict] = []
-        for row in rows:
-            msg = dict(row)
-            if regex.search(msg.get("text") or ""):
-                results.append(msg)
-                if len(results) >= limit:
-                    break
-        return results
+    def search_regex(
+        self,
+        pattern: str,
+        chat_id: int | None = None,
+        limit: int = 50,
+        after: str | None = None,
+        before: str | None = None,
+    ) -> list[dict]:
+        """Search cached messages using a regex pattern (case-insensitive).
+
+        Synchronous convenience wrapper. The daemon fetches candidates on the
+        event loop and runs :func:`regex_filter` in a worker thread instead.
+        """
+        compiled = compile_search_pattern(pattern)
+        rows = self.regex_candidates(chat_id=chat_id, after=after, before=before)
+        return regex_filter(rows, compiled, limit)
 
     def get_message_ids(self, chat_id: int, msg_ids: list[int]) -> set[int]:
         """Return the subset of msg_ids that already exist in cache for a chat."""
@@ -276,7 +344,7 @@ class MessageCache:
     def get_today(self, chat_id: int | None = None, limit: int = 5000) -> list[dict]:
         """Return all cached messages from today (UTC)."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        sql = "SELECT * FROM messages WHERE date >= ?"
+        sql = f"SELECT {_MSG_COLUMNS} FROM messages WHERE date >= ?"
         params: list = [f"{today}T00:00:00"]
 
         if chat_id is not None:
@@ -297,7 +365,7 @@ class MessageCache:
         before: str | None = None,
     ) -> list[dict]:
         """Export cached messages in chronological order."""
-        sql = "SELECT * FROM messages WHERE 1=1"
+        sql = f"SELECT {_MSG_COLUMNS} FROM messages WHERE 1=1"
         params: list = []
 
         if chat_id is not None:
