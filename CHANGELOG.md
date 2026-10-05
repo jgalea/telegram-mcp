@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 (2026-10-05)
+
+### Security
+- **`send_allowlist` compares resolved peers, not spellings.** The 0.2.0 gate normalised the caller's string against the config entries, which neither equated the many spellings Telethon accepts for one peer (`@Name`, `name`, `t.me/name`, phone, bare id, `-100` id) nor told a user id from a channel with the same number. Recipient and entries now go through Telethon to marked peer ids; an unresolvable recipient is refused, an unresolvable entry matches nothing.
+- **Policy gates fail closed.** Any exception while evaluating the allowlist or budget refuses the call. A config.json that cannot be read or parsed yields read-only with an empty allowlist. An unknown `mode` is read-only. `TELEGRAM_MCP_READ_ONLY` is on for any value other than `0`/`false`/`no`/`off`/empty.
+- **The daemon inherits `TELEGRAM_MCP_READ_ONLY` from the session that starts it.** 0.2.0 stripped it, which left the env var enforced only by the proxy, and the proxy can be bypassed by anything that can open the Unix socket.
+
+### Added
+- `get_status` reports `read_only`, `send_allowlist` (entry and resolved counts, never the entries), `write_per_hour` and `write_calls_last_hour`.
+
 ## 0.2.0 (2026-10-05)
 
 ### Security

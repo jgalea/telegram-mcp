@@ -328,11 +328,11 @@ Every tool also carries MCP annotations (`readOnlyHint`, `destructiveHint`, `ide
 
 ### Read-only mode
 
-Set `"mode": "read_only"` in `config.json` to make the daemon refuse every tool that mutates Telegram state (and `clear_cache`), for every session on the machine. Set `TELEGRAM_MCP_READ_ONLY=1` in the environment of a single MCP client to make just that session read-only: the proxy hides the write tools from the model and tags each request so the daemon refuses them too. The env var is not passed on to a daemon the session happens to start, so one read-only session cannot silently turn the shared daemon read-only for others. Config changes take effect when the daemon restarts.
+Set `"mode": "read_only"` in `config.json` to make the daemon refuse every tool that mutates Telegram state (and `clear_cache`), for every session on the machine. Set `TELEGRAM_MCP_READ_ONLY=1` in the environment of an MCP client to make that session read-only: the proxy hides the write tools from the model and tags each request so the daemon refuses them too. Any value other than `0`, `false`, `no`, `off` or empty counts as on, and an unrecognised `mode` is treated as `read_only`; a config file that cannot be read or parsed also puts the daemon in read-only mode with an empty send allowlist. The daemon inherits the environment of the session that starts it, so a daemon started from a read-only session is read-only for every session until it is restarted from a full one; `get_status` reports `read_only` so this is visible. Config changes take effect when the daemon restarts.
 
 ### Send allowlist
 
-Off by default. Set `"send_allowlist": [123456789, "@alice"]` in `config.json` and the daemon refuses `send_message`, `schedule_message`, `edit_message`, `send_reaction`, `send_file`, `send_voice`, `send_location` and `forward_message` (by destination) to any peer not on the list. Entries are numeric chat IDs or `@usernames`; a peer is matched on whichever form the call uses, so list both if you address the same chat both ways. The allowlist lives only in `config.json`; no tool can read or change it. An empty list refuses every send.
+Off by default. Set `"send_allowlist": [123456789, "@alice"]` in `config.json` and the daemon refuses `send_message`, `schedule_message`, `edit_message`, `send_reaction`, `send_file`, `send_voice`, `send_location` and `forward_message` (by destination) to any peer not on the list. Entries can be anything Telethon resolves: numeric ids, `@usernames`, `t.me/` links or phone numbers. The recipient of each call and every entry are resolved through Telethon to a peer id before comparing, so the spelling on either side does not matter and a bare id cannot be confused with a channel of the same number. A recipient that cannot be resolved is refused; an entry that cannot be resolved matches nothing and is retried on the next refusal. An empty list refuses every send. The allowlist lives only in `config.json`; no tool can read or change it, and `get_status` reports only how many entries it has.
 
 ### Write budget and audit log
 
@@ -412,7 +412,7 @@ This server has the same access as your Telegram account. It can read all your c
 - `upload_dirs`: directories files may be sent from.
 - `cache_max_age_days`: prune cached messages older than this on daemon start.
 
-`get_status` reports the installed package version, the git sha when running from a checkout, and the source file's modification time, so a stale install is visible.
+`get_status` reports the installed package version, the git sha when running from a checkout, the source file's modification time, and the daemon's policy (`read_only`, `send_allowlist` entry count, `write_per_hour`, writes used this hour), so a stale install or an unexpected mode is visible.
 
 ## Development
 
