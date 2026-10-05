@@ -333,3 +333,26 @@ class TestGetStatus:
         assert out["source_dir"].endswith("telegram_mcp")
         assert out["source_mtime"]
         assert "git_sha" in out
+
+
+class TestResolvePeerId:
+    async def test_returns_marked_id_via_input_entity(self, client):
+        from telethon.tl.types import InputPeerChannel, InputPeerUser
+
+        client._client.get_input_entity.return_value = InputPeerChannel(
+            channel_id=5, access_hash=1
+        )
+        assert await client.resolve_peer_id(5) == -1000000000005
+        client._client.get_input_entity.assert_awaited_with(5)
+
+        client._client.get_input_entity.return_value = InputPeerUser(user_id=777, access_hash=1)
+        assert await client.resolve_peer_id("alice") == 777
+        # normalised the same way the send path normalises it
+        client._client.get_input_entity.assert_awaited_with("@alice")
+
+    async def test_resolution_failure_propagates(self, client):
+        client._client.get_input_entity.side_effect = ValueError("no such entity")
+        with pytest.raises(ValueError):
+            await client.resolve_peer_id("@nobody")
+        with pytest.raises((ValueError, TypeError)):
+            await client.resolve_peer_id("")

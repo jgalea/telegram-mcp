@@ -50,6 +50,10 @@ AUDIT_PATH = os.path.join(CONFIG_DIR, "audit.log")
 _ALL_TOOLS_CACHE: frozenset[str] | None = None
 _POLICY: Policy | None = None
 _WRITE_BUDGET: RateLimiter | None = None
+# send_allowlist entries resolved to marked peer ids, and the entries that
+# could not be resolved yet (retried on the next refusal).
+_RESOLVED_ALLOWLIST: frozenset[int] | None = None
+_UNRESOLVED_ALLOWLIST: tuple[int | str, ...] = ()
 
 
 def _policy() -> Policy:
@@ -65,6 +69,105 @@ def _write_budget() -> RateLimiter:
     if _WRITE_BUDGET is None:
         _WRITE_BUDGET = RateLimiter(_policy().write_per_hour, 3600.0)
     return _WRITE_BUDGET
+
+
+async def _resolve_entries(
+    client: TelegramMCPClient, entries: tuple[int | str, ...],
+) -> tuple[set[int], tuple[int | str, ...]]:
+    resolved: set[int] = set()
+    failed: list[int | str] = []
+    for entry in entries:
+        try:
+            resolved.add(await client.resolve_peer_id(entry))
+        except Exception as e:
+            logger.warning(
+                "send_allowlist: entry #%d could not be resolved (%s); it matches nothing",
+                entries.index(entry) + 1, type(e).__name__,
+            )
+            failed.append(entry)
+    return resolved, tuple(failed)
+
+
+async def _resolved_allowlist(client: TelegramMCPClient, refresh: bool = False) -> frozenset[int]:
+    """Marked peer ids for the configured send_allowlist.
+
+    Resolved through Telethon on first use (and only then, since it needs a
+    connection). An entry that fails to resolve matches nothing; *refresh*
+    retries just those entries.
+    """
+    global _RESOLVED_ALLOWLIST, _UNRESOLVED_ALLOWLIST
+    entries = _policy().send_allowlist or ()
+    if _RESOLVED_ALLOWLIST is None:
+        ids, _UNRESOLVED_ALLOWLIST = await _resolve_entries(client, entries)
+        _RESOLVED_ALLOWLIST = frozenset(ids)
+    elif refresh and _UNRESOLVED_ALLOWLIST:
+        ids, _UNRESOLVED_ALLOWLIST = await _resolve_entries(client, _UNRESOLVED_ALLOWLIST)
+        _RESOLVED_ALLOWLIST = _RESOLVED_ALLOWLIST | ids
+    return _RESOLVED_ALLOWLIST
+
+
+async def _peer_allowed(client: TelegramMCPClient, peer: object) -> bool:
+    """Whether a send may target *peer* under the active allowlist.
+
+    Both sides are compared as Telethon marked peer ids, resolved the same
+    way the send itself will resolve them. Anything that cannot be resolved
+    is refused.
+    """
+    if isinstance(peer, bool) or not isinstance(peer, (int, str)):
+        return False
+    try:
+        peer_id = await client.resolve_peer_id(peer)
+    except Exception as e:
+        logger.warning("send_allowlist: recipient could not be resolved (%s)", type(e).__name__)
+        return False
+    if peer_id in await _resolved_allowlist(client):
+        return True
+    if _UNRESOLVED_ALLOWLIST:
+        return peer_id in await _resolved_allowlist(client, refresh=True)
+    return False
+
+
+async def _write_gates(
+    client: TelegramMCPClient, tool: str, call_args: dict[str, Any],
+) -> str | None:
+    """Run the allowlist and budget gates for a write-tier call.
+
+    Returns an error string to refuse with, or None to proceed. Any exception
+    is the caller's signal to refuse as well.
+    """
+    policy = _policy()
+    if tool in PEER_SEND_TOOLS and policy.allowlist_active:
+        await client.ensure_connected()
+        if not await _peer_allowed(client, call_args.get(PEER_SEND_TOOLS[tool])):
+            _audit(tool, call_args, "refused:allowlist")
+            return f"'{tool}' refused: recipient is not in send_allowlist"
+
+    try:
+        _write_budget().acquire()
+    except RuntimeError:
+        _audit(tool, call_args, "refused:budget")
+        return (
+            f"'{tool}' refused: hourly write budget of {policy.write_per_hour} calls exhausted"
+        )
+    return None
+
+
+def _policy_status() -> dict[str, Any]:
+    """Policy summary merged into get_status: counts and flags, never entries."""
+    policy = _policy()
+    status: dict[str, Any] = {
+        "read_only": policy.read_only,
+        "write_per_hour": policy.write_per_hour,
+        "write_calls_last_hour": _write_budget().used,
+    }
+    if policy.allowlist_active:
+        status["send_allowlist"] = {
+            "entries": len(policy.send_allowlist or ()),
+            "resolved": len(_RESOLVED_ALLOWLIST) if _RESOLVED_ALLOWLIST is not None else None,
+        }
+    else:
+        status["send_allowlist"] = "off"
+    return status
 
 
 def _all_tools() -> frozenset[str]:
@@ -160,13 +263,17 @@ async def _handle_request(client: TelegramMCPClient, payload: dict[str, Any]) ->
          boolean true. Truthy strings like "yes" or 1 do not count.
 
       4. Send allowlist: when config.json sets ``send_allowlist``, any tool
-         that delivers content to a peer outside it is refused.
+         that delivers content to a peer outside it is refused. Recipient
+         and allowlist entries are compared as Telethon marked peer ids,
+         resolved the same way the send resolves them; anything that fails
+         to resolve is refused.
 
       5. Hourly write budget: a sliding-window cap on write-tier calls, on
          top of the per-second limiter inside the client.
 
-    Every write-tier call, including refusals at gates 4 and 5, is appended
-    to the audit log.
+    Gates 4 and 5 fail closed: any exception while evaluating them refuses
+    the call. Every write-tier call, including refusals, is appended to the
+    audit log.
     """
     req_id = payload.get("id")
     tool = payload.get("tool")
@@ -204,27 +311,16 @@ async def _handle_request(client: TelegramMCPClient, payload: dict[str, Any]) ->
     call_args = {k: v for k, v in args.items() if k != "confirm"}
     is_write = tool in WRITE_TOOLS
 
-    if is_write and tool in PEER_SEND_TOOLS:
-        peer = call_args.get(PEER_SEND_TOOLS[tool])
-        if not _policy().peer_allowed(peer):
-            _audit(tool, call_args, "refused:allowlist")
-            return {
-                "id": req_id,
-                "error": f"'{tool}' refused: recipient is not in send_allowlist",
-            }
-
     if is_write:
         try:
-            _write_budget().acquire()
-        except RuntimeError:
-            _audit(tool, call_args, "refused:budget")
-            return {
-                "id": req_id,
-                "error": (
-                    f"'{tool}' refused: hourly write budget of"
-                    f" {_policy().write_per_hour} calls exhausted"
-                ),
-            }
+            refusal = await _write_gates(client, tool, call_args)
+        except Exception as e:
+            # Fail closed: a broken gate must never let a write through.
+            logger.exception("Policy gate failed for %s; refusing", tool)
+            _audit(tool, call_args, "refused:gate_error")
+            return {"id": req_id, "error": f"'{tool}' refused: policy check failed ({e})"}
+        if refusal:
+            return {"id": req_id, "error": refusal}
 
     try:
         await client.ensure_connected()
@@ -241,6 +337,8 @@ async def _handle_request(client: TelegramMCPClient, payload: dict[str, Any]) ->
 
     if is_write:
         _audit(tool, call_args, "ok")
+    if tool == "get_status" and isinstance(result, dict):
+        result = {**result, **_policy_status()}
     return {"id": req_id, "result": result}
 
 

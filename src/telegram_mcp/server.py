@@ -26,7 +26,6 @@ from mcp.types import TextContent, Tool, ToolAnnotations
 from telegram_mcp._registry import (
     DESTRUCTIVE_TOOLS,
     LOCAL_ONLY_TOOLS,
-    READ_ONLY_ENV,
     is_read_only_tool,
     load_policy,
 )
@@ -59,19 +58,19 @@ def _spawn_daemon() -> None:
     during Telethon connect are diagnosable. Without this, a daemon that died
     on startup left no trace and looked indistinguishable from "server fine".
 
-    TELEGRAM_MCP_READ_ONLY is scoped to the session that set it, so it is
-    stripped from the child's environment: the daemon is shared by every
-    session on the machine, and a read-only session must not silently turn
-    the daemon read-only for all of them. Machine-wide read-only belongs in
-    config.json (``"mode": "read_only"``). Read-only sessions still tag each
-    request so the daemon refuses write tools for them.
+    The child inherits this process's environment on purpose, including
+    TELEGRAM_MCP_READ_ONLY. The daemon is shared by every session on the
+    machine, so a daemon started from a read-only session is read-only for
+    all of them until it is restarted from a full session. That is the
+    fail-closed direction: anything that can open the Unix socket can skip
+    the proxy's own filtering, so the restriction has to live in the daemon.
+    get_status reports the daemon's mode.
     """
     from telegram_mcp.login import CONFIG_DIR  # noqa: PLC0415
 
     log_path = os.path.join(CONFIG_DIR, "daemon.log")
     os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    env = {k: v for k, v in os.environ.items() if k != READ_ONLY_ENV}
     try:
         cmd = [sys.argv[0], "daemon"]
         subprocess.Popen(
@@ -81,7 +80,6 @@ def _spawn_daemon() -> None:
             stderr=log_fd,
             start_new_session=True,
             close_fds=True,
-            env=env,
         )
     finally:
         os.close(log_fd)

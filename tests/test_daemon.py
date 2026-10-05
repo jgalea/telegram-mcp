@@ -272,6 +272,8 @@ def policy(monkeypatch, tmp_path):
     def set_policy(**kwargs):
         monkeypatch.setattr(daemon, "_POLICY", Policy(**kwargs))
         monkeypatch.setattr(daemon, "_WRITE_BUDGET", None)
+        monkeypatch.setattr(daemon, "_RESOLVED_ALLOWLIST", None)
+        monkeypatch.setattr(daemon, "_UNRESOLVED_ALLOWLIST", ())
 
     set_policy()
     return set_policy
@@ -381,6 +383,33 @@ class TestReadOnlyMode:
         assert policy_from_config({"mode": "full"}, {}).read_only is False
 
 
+# Marked peer ids the fake resolver knows about. Mirrors what Telethon's
+# get_input_entity + get_peer_id would return: every spelling of a peer maps
+# to one id; a bare id can belong to a user or a channel.
+_PEERS = {
+    42: 42, "42": 42,
+    "@alice": 777, "alice": 777, "@ALICE": 777, "ALICE": 777,
+    "https://t.me/alice": 777, "t.me/alice": 777, "+34600000000": 777,
+    "@bob": 888, "bob": 888,
+    "me": 1, "self": 1, "@me": 1,
+    # bare id 5 is a *channel* here; -1000000000005 is its marked id
+    5: -1000000000005, -1000000000005: -1000000000005,
+}
+
+
+def _fake_resolver(peer):
+    try:
+        return _PEERS[peer]
+    except KeyError:
+        raise ValueError("Cannot find any entity corresponding to the peer") from None
+
+
+def _resolving_client(**methods):
+    client = _client_with(**methods)
+    client.resolve_peer_id = AsyncMock(side_effect=_fake_resolver)
+    return client
+
+
 class TestSendAllowlist:
     @pytest.mark.parametrize(
         "tool,args",
@@ -390,30 +419,124 @@ class TestSendAllowlist:
             ("send_voice", {"chat_id": 999, "file_path": "/tmp/x"}),
             ("send_location", {"chat_id": 999, "lat": 1.0, "lon": 2.0}),
             ("schedule_message", {"chat_id": 999, "text": "hi", "schedule_date": "2030-01-01"}),
+            ("edit_message", {"chat_id": "@bob", "message_id": 1, "text": "hi"}),
+            ("send_reaction", {"chat_id": "@bob", "message_id": 1, "emoji": "x"}),
             ("forward_message", {"from_chat": 42, "message_ids": [1], "to_chat": 999,
                                  "confirm": True}),
         ],
     )
     async def test_peer_outside_allowlist_is_refused(self, policy, tool, args):
-        policy(send_allowlist=frozenset({42, "@alice"}))
+        policy(send_allowlist=(42, "@alice"))
         method = AsyncMock()
-        client = _client_with(**{tool: method})
+        client = _resolving_client(**{tool: method})
         result = await daemon._handle_request(client, {"id": 1, "tool": tool, "args": args})
         assert "send_allowlist" in result["error"], f"{tool} not enforced"
         method.assert_not_awaited()
 
-    async def test_peer_inside_allowlist_passes(self, policy):
-        policy(send_allowlist=frozenset({42, "@alice"}))
-        client = _client_with(send_message=AsyncMock(return_value={"id": 1}))
-        for peer in (42, "42", "@alice", "alice", "@ALICE"):
+    async def test_every_spelling_of_an_allowed_peer_passes(self, policy):
+        """Comparison is by resolved peer id, so any spelling Telethon accepts works."""
+        policy(send_allowlist=(42, "@alice"))
+        client = _resolving_client(send_message=AsyncMock(return_value={"id": 1}))
+        for peer in (42, "42", "@alice", "alice", "@ALICE", "https://t.me/alice",
+                     "+34600000000"):
             result = await daemon._handle_request(
                 client, {"id": 1, "tool": "send_message", "args": {"chat_id": peer, "text": "x"}}
             )
             assert "error" not in result, f"{peer!r} wrongly refused: {result}"
 
+    async def test_allowlist_entry_spelling_does_not_matter_either(self, policy):
+        policy(send_allowlist=("t.me/alice",))
+        client = _resolving_client(send_message=AsyncMock(return_value={"id": 1}))
+        result = await daemon._handle_request(
+            client, {"id": 1, "tool": "send_message", "args": {"chat_id": "@ALICE", "text": "x"}}
+        )
+        assert "error" not in result
+
+    async def test_bare_id_namespace_is_not_trusted(self, policy):
+        """Allowlisting user id 5 must not admit channel 5 (marked -100...5), and
+        vice versa: both sides go through the same resolution."""
+        policy(send_allowlist=(5,))  # resolves to the channel
+        client = _resolving_client(send_message=AsyncMock(return_value={"id": 1}))
+        ok = await daemon._handle_request(
+            client, {"id": 1, "tool": "send_message",
+                     "args": {"chat_id": -1000000000005, "text": "x"}}
+        )
+        assert "error" not in ok
+        # A peer that merely *looks* like 5 as a string but resolves elsewhere is refused
+        client.resolve_peer_id = AsyncMock(side_effect=lambda p: 5 if p == 5 else 999)
+        policy(send_allowlist=(5,))
+        refused = await daemon._handle_request(
+            client, {"id": 2, "tool": "send_message", "args": {"chat_id": "@five", "text": "x"}}
+        )
+        assert "send_allowlist" in refused["error"]
+
+    async def test_unresolvable_recipient_is_refused(self, policy):
+        policy(send_allowlist=(42,))
+        client = _resolving_client(send_message=AsyncMock(return_value={"id": 1}))
+        for peer in ("@nobody", 3.5, None, True, [42], {"id": 42}):
+            result = await daemon._handle_request(
+                client, {"id": 1, "tool": "send_message", "args": {"chat_id": peer, "text": "x"}}
+            )
+            assert "send_allowlist" in result.get("error", ""), f"{peer!r} slipped through"
+        client.send_message.assert_not_awaited()
+
+    async def test_unresolvable_entry_matches_nothing_and_is_retried(self, policy):
+        policy(send_allowlist=("@alice", "@notyet"))
+        client = _resolving_client(send_message=AsyncMock(return_value={"id": 1}))
+
+        refused = await daemon._handle_request(
+            client, {"id": 1, "tool": "send_message", "args": {"chat_id": "@bob", "text": "x"}}
+        )
+        assert "send_allowlist" in refused["error"]
+        assert daemon._UNRESOLVED_ALLOWLIST == ("@notyet",)
+
+        # The entry becomes resolvable (e.g. the user is now in contacts): the
+        # next refusal re-resolves it and the send goes through.
+        _PEERS["@notyet"] = 888
+        try:
+            ok = await daemon._handle_request(
+                client, {"id": 2, "tool": "send_message", "args": {"chat_id": "@bob", "text": "x"}}
+            )
+        finally:
+            del _PEERS["@notyet"]
+        assert "error" not in ok
+        assert daemon._UNRESOLVED_ALLOWLIST == ()
+
+    async def test_resolution_uses_the_connected_client(self, policy):
+        policy(send_allowlist=(42,))
+        client = _resolving_client(send_message=AsyncMock(return_value={"id": 1}))
+        await daemon._handle_request(
+            client, {"id": 1, "tool": "send_message", "args": {"chat_id": 42, "text": "x"}}
+        )
+        assert client.ensure_connected.await_count >= 1
+        resolved_with = [c.args[0] for c in client.resolve_peer_id.await_args_list]
+        assert resolved_with == [42, 42]  # recipient, then the one allowlist entry
+
+    async def test_gate_exception_fails_closed(self, policy):
+        """A broken gate (resolver blowing up, connection failure, policy bug)
+        must refuse the write, not fall through to dispatch."""
+        policy(send_allowlist=(42,))
+        client = _resolving_client(send_message=AsyncMock(return_value={"id": 1}))
+        client.ensure_connected = AsyncMock(side_effect=ConnectionError("down"))
+        result = await daemon._handle_request(
+            client, {"id": 1, "tool": "send_message", "args": {"chat_id": 42, "text": "x"}}
+        )
+        assert "policy check failed" in result["error"]
+        client.send_message.assert_not_awaited()
+
+        client = _resolving_client(mark_read=AsyncMock(return_value={}))
+        monkey_budget = MagicMock()
+        monkey_budget.acquire.side_effect = ZeroDivisionError("bug")
+        daemon._WRITE_BUDGET = monkey_budget
+        result = await daemon._handle_request(
+            client, {"id": 2, "tool": "mark_read", "args": {"chat_id": 1}}
+        )
+        assert "policy check failed" in result["error"]
+        client.mark_read.assert_not_awaited()
+
     async def test_forward_source_is_not_checked_only_destination(self, policy):
-        policy(send_allowlist=frozenset({42}))
-        client = _client_with(forward_message=AsyncMock(return_value={"status": "forwarded"}))
+        policy(send_allowlist=(42,))
+        client = _resolving_client(forward_message=AsyncMock(return_value={"status": "forwarded"}))
         result = await daemon._handle_request(
             client,
             {"id": 1, "tool": "forward_message",
@@ -421,13 +544,35 @@ class TestSendAllowlist:
         )
         assert result["result"] == {"status": "forwarded"}
 
+    async def test_forward_without_confirm_never_reaches_allowlist(self, policy):
+        policy(send_allowlist=(42,))
+        client = _resolving_client(forward_message=AsyncMock())
+        result = await daemon._handle_request(
+            client,
+            {"id": 1, "tool": "forward_message",
+             "args": {"from_chat": 1, "message_ids": [1], "to_chat": 999}},
+        )
+        assert "warning" in result["result"]
+        client.resolve_peer_id.assert_not_awaited()
+        client.forward_message.assert_not_awaited()
+
     async def test_reads_unaffected(self, policy):
-        policy(send_allowlist=frozenset({42}))
-        client = _client_with(read_messages=AsyncMock(return_value=[]))
+        policy(send_allowlist=(42,))
+        client = _resolving_client(read_messages=AsyncMock(return_value=[]))
         result = await daemon._handle_request(
             client, {"id": 1, "tool": "read_messages", "args": {"chat_id": 999}}
         )
         assert result["result"] == []
+        client.resolve_peer_id.assert_not_awaited()
+
+    async def test_no_allowlist_means_no_resolution(self, policy):
+        policy()
+        client = _resolving_client(send_message=AsyncMock(return_value={"id": 1}))
+        result = await daemon._handle_request(
+            client, {"id": 1, "tool": "send_message", "args": {"chat_id": "@anyone", "text": "x"}}
+        )
+        assert "error" not in result
+        client.resolve_peer_id.assert_not_awaited()
 
     async def test_allowlist_not_settable_by_tool(self):
         from telegram_mcp.server import TOOLS
@@ -436,6 +581,31 @@ class TestSendAllowlist:
         assert not any("allowlist" in n or "policy" in n or "config" in n for n in names)
         for t in TOOLS:
             assert "send_allowlist" not in t.inputSchema.get("properties", {})
+
+
+class TestStatusReportsPolicy:
+    async def test_get_status_carries_policy_summary_not_entries(self, policy):
+        policy(read_only=False, send_allowlist=(42, "@alice"), write_per_hour=7)
+        client = _resolving_client(
+            get_status=AsyncMock(return_value={"connected": True}),
+            mark_read=AsyncMock(return_value={}),
+        )
+        await daemon._handle_request(client, {"id": 0, "tool": "mark_read", "args": {"chat_id": 1}})
+        result = await daemon._handle_request(client, {"id": 1, "tool": "get_status", "args": {}})
+        body = result["result"]
+        assert body["connected"] is True
+        assert body["read_only"] is False
+        assert body["write_per_hour"] == 7
+        assert body["write_calls_last_hour"] == 1
+        assert body["send_allowlist"] == {"entries": 2, "resolved": None}
+        assert "alice" not in str(body) and "42" not in str(body["send_allowlist"])
+
+    async def test_get_status_shows_read_only_daemon(self, policy):
+        policy(read_only=True)
+        client = _client_with(get_status=AsyncMock(return_value={"connected": True}))
+        result = await daemon._handle_request(client, {"id": 1, "tool": "get_status", "args": {}})
+        assert result["result"]["read_only"] is True
+        assert result["result"]["send_allowlist"] == "off"
 
 
 class TestWriteBudgetAndAudit:
@@ -488,11 +658,12 @@ class TestWriteBudgetAndAudit:
         assert text[:81] not in lines[0]
 
     async def test_audit_log_records_refusals_and_errors(self, policy, tmp_path):
-        policy(send_allowlist=frozenset({1}), write_per_hour=1)
+        policy(send_allowlist=(1,), write_per_hour=1)
         client = _client_with(
             send_message=AsyncMock(side_effect=RuntimeError("flood")),
             mark_read=AsyncMock(return_value={}),
         )
+        client.resolve_peer_id = AsyncMock(side_effect=lambda p: p)
         await daemon._handle_request(
             client, {"id": 1, "tool": "send_message", "args": {"chat_id": 2, "text": "x"}}
         )

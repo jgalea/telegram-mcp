@@ -18,8 +18,11 @@ Tiers:
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 DESTRUCTIVE_TOOLS: frozenset[str] = frozenset({
     "delete_chat",
@@ -110,64 +113,105 @@ def text_arg(tool: str) -> str | None:
 READ_ONLY_ENV = "TELEGRAM_MCP_READ_ONLY"
 DEFAULT_WRITE_PER_HOUR = 200
 
+# Only these spellings turn the env var off. Anything else that is set,
+# including typos like "enabled", counts as on: the variable exists to
+# restrict, so an unrecognised value must not silently widen access.
+_ENV_FALSE = frozenset({"", "0", "false", "no", "off"})
+_MODE_FULL = frozenset({"", "full", "read_write", "readwrite", "rw"})
+_MODE_READ_ONLY = frozenset({"read_only", "readonly", "ro"})
+
 
 def env_read_only(environ: dict[str, str] | None = None) -> bool:
-    val = (environ if environ is not None else os.environ).get(READ_ONLY_ENV, "")
-    return val.strip().lower() in ("1", "true", "yes", "on")
+    env = environ if environ is not None else os.environ
+    if READ_ONLY_ENV not in env:
+        return False
+    return env[READ_ONLY_ENV].strip().lower() not in _ENV_FALSE
+
+
+def _mode_read_only(mode: object) -> bool:
+    if mode is None:
+        return False
+    if isinstance(mode, bool):
+        return mode
+    key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
+    if key in _MODE_FULL:
+        return False
+    if key in _MODE_READ_ONLY:
+        return True
+    logger.error("config.json: unknown mode %r; treating it as read_only", mode)
+    return True
 
 
 @dataclass(frozen=True)
 class Policy:
-    """Runtime policy from config.json and the environment. Not tool-settable."""
+    """Runtime policy from config.json and the environment. Not tool-settable.
+
+    ``send_allowlist`` holds the raw entries (ints or strings) as written in
+    config.json. The daemon resolves them to Telegram peer ids through
+    Telethon and compares resolved ids, never the spellings: a peer has many
+    spellings (``@Name``, ``name``, ``t.me/name``, a phone number, a bare id,
+    a ``-100`` channel id) and Telethon accepts all of them, so a string
+    comparison can neither equate the same peer nor tell two apart.
+    """
 
     read_only: bool = False
-    send_allowlist: frozenset[int | str] | None = None
+    send_allowlist: tuple[int | str, ...] | None = None
     write_per_hour: int = DEFAULT_WRITE_PER_HOUR
 
-    def peer_allowed(self, peer: object) -> bool:
-        if self.send_allowlist is None:
-            return True
-        return _normalize_peer(peer) in self.send_allowlist
+    @property
+    def allowlist_active(self) -> bool:
+        return self.send_allowlist is not None
 
 
-def _normalize_peer(value: object) -> int | str | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    return value.lower() if value.startswith("@") else f"@{value.lower()}"
+FAIL_CLOSED_POLICY = Policy(read_only=True, send_allowlist=(), write_per_hour=1)
+
+
+def _clean_allowlist(raw: object) -> tuple[int | str, ...]:
+    if not isinstance(raw, list):
+        raise ValueError("send_allowlist must be a list of chat ids or @usernames")
+    entries: list[int | str] = []
+    for item in raw:
+        if isinstance(item, bool):
+            raise ValueError(f"send_allowlist entry {item!r} is not a chat id or username")
+        if isinstance(item, int):
+            entries.append(item)
+        elif isinstance(item, str) and item.strip():
+            entries.append(item.strip())
+        else:
+            raise ValueError(f"send_allowlist entry {item!r} is not a chat id or username")
+    return tuple(entries)
 
 
 def policy_from_config(config: dict, environ: dict[str, str] | None = None) -> Policy:
-    read_only = env_read_only(environ) or config.get("mode") == "read_only"
+    if not isinstance(config, dict):
+        raise ValueError("config.json must contain a JSON object")
 
-    allowlist: frozenset[int | str] | None = None
-    raw = config.get("send_allowlist")
-    if raw is not None:
-        if not isinstance(raw, list):
-            raise ValueError("send_allowlist must be a list of chat ids or @usernames")
-        normalized = {_normalize_peer(v) for v in raw}
-        normalized.discard(None)
-        allowlist = frozenset(normalized)
+    read_only = env_read_only(environ) or _mode_read_only(config.get("mode"))
 
-    per_hour = config.get("rate_limits", {}).get("write_per_hour", DEFAULT_WRITE_PER_HOUR)
-    per_hour = int(per_hour)
-    if per_hour < 1:
-        raise ValueError("rate_limits.write_per_hour must be at least 1")
+    allowlist: tuple[int | str, ...] | None = None
+    if config.get("send_allowlist") is not None:
+        allowlist = _clean_allowlist(config["send_allowlist"])
 
-    return Policy(read_only=read_only, send_allowlist=allowlist, write_per_hour=per_hour)
+    rate_limits = config.get("rate_limits") or {}
+    if not isinstance(rate_limits, dict):
+        raise ValueError("rate_limits must be an object")
+    per_hour = rate_limits.get("write_per_hour", DEFAULT_WRITE_PER_HOUR)
+    if isinstance(per_hour, bool) or not isinstance(per_hour, (int, float)) or per_hour < 1:
+        raise ValueError("rate_limits.write_per_hour must be a number of at least 1")
+
+    return Policy(read_only=read_only, send_allowlist=allowlist, write_per_hour=int(per_hour))
 
 
 def load_policy() -> Policy:
+    """Policy from ~/.telegram-mcp/config.json plus the environment.
+
+    Fails closed: if the config cannot be read or parsed, the result is
+    read-only with an empty allowlist, and the error is logged.
+    """
     from telegram_mcp.login import load_config  # noqa: PLC0415 - avoid import cycle
 
-    return policy_from_config(load_config())
+    try:
+        return policy_from_config(load_config())
+    except Exception:
+        logger.exception("Could not load policy from config.json; running fail-closed")
+        return FAIL_CLOSED_POLICY

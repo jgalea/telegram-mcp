@@ -329,13 +329,20 @@ class RateLimiter:
         self.period = period
         self._timestamps: list[float] = []
 
+    @property
+    def used(self) -> int:
+        """Calls recorded inside the current window."""
+        self._evict()
+        return len(self._timestamps)
+
+    def _evict(self) -> None:
+        cutoff = time.monotonic() - self.period
+        self._timestamps = [t for t in self._timestamps if t > cutoff]
+
     def acquire(self) -> None:
         """Record a call, raising :class:`RuntimeError` if the rate limit is exceeded."""
         now = time.monotonic()
-        cutoff = now - self.period
-
-        # Evict expired timestamps
-        self._timestamps = [t for t in self._timestamps if t > cutoff]
+        self._evict()
 
         if len(self._timestamps) >= self.max_calls:
             raise RuntimeError(

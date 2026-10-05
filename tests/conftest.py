@@ -20,5 +20,7 @@ def isolated_policy(monkeypatch, tmp_path):
 
     monkeypatch.setattr(daemon, "_POLICY", Policy())
     monkeypatch.setattr(daemon, "_WRITE_BUDGET", None)
+    monkeypatch.setattr(daemon, "_RESOLVED_ALLOWLIST", None)
+    monkeypatch.setattr(daemon, "_UNRESOLVED_ALLOWLIST", ())
     monkeypatch.setattr(daemon, "AUDIT_PATH", str(tmp_path / "audit.log"))
     monkeypatch.setattr(server, "_READ_ONLY", False)

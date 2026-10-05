@@ -304,7 +304,9 @@ class TestReadOnlyProxy:
 
 
 class TestSpawnDaemonHygiene:
-    def test_config_dir_created_0700_and_env_stripped(self, monkeypatch, tmp_path):
+    def test_config_dir_created_0700_and_read_only_env_inherited(self, monkeypatch, tmp_path):
+        """A daemon started from a read-only session must itself be read-only:
+        the proxy filter alone can be bypassed by talking to the socket."""
         import os
         import stat
 
@@ -322,9 +324,8 @@ class TestSpawnDaemonHygiene:
 
         assert stat.S_IMODE(os.stat(cfg).st_mode) == 0o700
         assert stat.S_IMODE(os.stat(cfg / "daemon.log").st_mode) == 0o600
-        env = popen_calls[0]["env"]
-        assert "TELEGRAM_MCP_READ_ONLY" not in env
-        assert env["KEEP_ME"] == "yes"
+        env = popen_calls[0].get("env")
+        assert env is None or env.get("TELEGRAM_MCP_READ_ONLY") == "1"
 
 
 class TestDaemonLogging:

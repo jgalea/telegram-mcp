@@ -985,6 +985,18 @@ class TelegramMCPClient:
             "phone": me.phone,
         }
 
+    async def resolve_peer_id(self, peer: int | str) -> int:
+        """Resolve *peer* exactly as a send would, to Telethon's marked peer id.
+
+        Marked ids are unambiguous across users (positive), small groups
+        (negative) and channels (``-100`` prefixed), unlike the bare ids the
+        tools accept. Raises if Telethon cannot resolve the peer.
+        """
+        from telethon.utils import get_peer_id  # noqa: PLC0415
+
+        entity = await self._client.get_input_entity(validate_chat_id(peer))
+        return get_peer_id(entity)
+
     async def get_status(self) -> dict[str, Any]:
         connected = self._client.is_connected()
         authorized = await self._client.is_user_authorized() if connected else False
