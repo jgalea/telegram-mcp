@@ -165,7 +165,7 @@ Same root cause as the first item — run `telegram-mcp login`. "Not configured"
 
 | Tool | Description |
 |------|-------------|
-| `download_media` | Download a photo, video, or document from a message |
+| `download_media` | Download a photo, video, or document from a message (never overwrites) |
 | `send_file` | Send a file or photo to a chat |
 | `send_voice` | Send a voice message |
 | `send_location` | Send a location |
@@ -206,7 +206,7 @@ Same root cause as the first item — run `telegram-mcp login`. "Not configured"
 | `get_me` | Current account info |
 | `get_status` | Connection status and session health |
 | `get_dialogs_stats` | Unread counts and chat activity summary |
-| `export_chat` | Export messages from a chat as JSON (max 1000 per call) |
+| `export_chat` | Export a chat (max 1000 messages) to a JSON file in the downloads dir |
 | `clear_cache` | Wipe the local message cache |
 
 ## Architecture
@@ -246,9 +246,12 @@ All data lives in `~/.telegram-mcp/`:
 
 ```
 ~/.telegram-mcp/
-├── config.json          # API ID, API hash
+├── config.json          # API ID, API hash, policy
 ├── session.session      # Telethon session file (auth state)
-└── cache.db             # SQLite message cache
+├── cache.db             # SQLite message cache
+├── audit.log            # Write-tier call log (rotates at 5 MB)
+├── daemon.log           # Daemon log (rotates at 5 MB, 2 backups)
+└── downloads/           # Downloaded media and exports
 ```
 
 ### Cache behavior
@@ -301,7 +304,11 @@ Hey, can you meet tomorrow at 3pm?
 [END TELEGRAM MESSAGE]
 ```
 
-Fenced fields: message bodies, chat titles, sender names, bios, filenames, captions, and forwarded-from text. Content is escaped before wrapping to prevent fence-escape attacks.
+Fenced fields: message bodies, media captions (the `text` of a media message, labelled `CAPTION`), sender names, chat titles (including the chat names reported by `sync_messages`), bios, the original sender of forwarded messages (`forward_from`), and filenames in download results (`path`, `filename`, `original_filename`). Scheduled messages are fenced like any other message.
+
+Fence markers found inside content are escaped before wrapping, so a message cannot close the fence early or forge a new opening tag. The escaping is case-insensitive, tolerates whitespace and zero-width characters between the words, and treats fullwidth and other lookalike brackets as brackets.
+
+The local cache stores each message's original text in a `raw_json` column for completeness. That column is never selected by any read path, so cached results go through the same fence as live ones.
 
 ### Tool tiers
 
@@ -310,26 +317,45 @@ Tools are classified by risk level:
 | Tier | Tools | Behavior |
 |------|-------|----------|
 | **Read** | `list_chats`, `read_messages`, `search_messages`, `get_chat_info`, etc. | No restrictions |
-| **Write** | `send_message`, `edit_message`, `send_file`, `pin_message`, etc. | Normal operation |
-| **Destructive** | `delete_chat`, `leave_chat`, `block_user`, `remove_participant`, `delete_message` | Require explicit `confirm: true` parameter. Without it, the tool returns a warning describing what would happen and asks for confirmation. |
+| **Write** | `send_message`, `edit_message`, `send_file`, `pin_message`, `mark_read`, etc. | Counted against the hourly write budget and written to the audit log |
+| **Destructive** | `delete_chat`, `leave_chat`, `block_user`, `remove_participant`, `delete_message`, `forward_message`, `get_invite_link`, `add_participant`, `create_group`, `create_channel`, `set_chat_title`, `set_chat_description`, `set_chat_photo` | Require `confirm: true` (a JSON boolean; `"yes"` or `1` do not count). Without it, the tool returns a warning describing what would happen instead of executing. |
 
-**Residual risk worth understanding:** `send_message` and `send_file` are Write-tier, not Destructive, so they don't require `confirm: true` — gating every send would make normal use unworkable. The fencing above is the primary defense, but no prompt-injection defense is perfect. If a crafted message ever defeats the fence, the worst case is the AI sending a message to a chat it shouldn't. Run this only with an AI client you trust, and treat outbound sends as something the model can do autonomously.
+The gates are enforced in the daemon, not only in the MCP proxy, so a process talking to the Unix socket directly is held to the same rules.
+
+Every tool also carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so clients that honour them can auto-approve reads and prompt on writes.
+
+**Residual risk worth understanding:** `send_message` and `send_file` are Write-tier, not Destructive, so they don't require `confirm: true`; gating every send would make normal use unworkable. Fencing is the primary defense, but no prompt-injection defense is perfect. If a crafted message ever defeats the fence, the worst case is the AI sending a message to a chat it shouldn't. The two controls below exist for that case: read-only mode removes the possibility entirely, and `send_allowlist` limits who can be reached. Run this only with an AI client you trust, and treat outbound sends as something the model can do autonomously.
+
+### Read-only mode
+
+Set `"mode": "read_only"` in `config.json` to make the daemon refuse every tool that mutates Telegram state (and `clear_cache`), for every session on the machine. Set `TELEGRAM_MCP_READ_ONLY=1` in the environment of a single MCP client to make just that session read-only: the proxy hides the write tools from the model and tags each request so the daemon refuses them too. The env var is not passed on to a daemon the session happens to start, so one read-only session cannot silently turn the shared daemon read-only for others. Config changes take effect when the daemon restarts.
+
+### Send allowlist
+
+Off by default. Set `"send_allowlist": [123456789, "@alice"]` in `config.json` and the daemon refuses `send_message`, `schedule_message`, `edit_message`, `send_reaction`, `send_file`, `send_voice`, `send_location` and `forward_message` (by destination) to any peer not on the list. Entries are numeric chat IDs or `@usernames`; a peer is matched on whichever form the call uses, so list both if you address the same chat both ways. The allowlist lives only in `config.json`; no tool can read or change it. An empty list refuses every send.
+
+### Write budget and audit log
+
+On top of the per-second limiter, write-tier calls share a sliding one-hour budget (`rate_limits.write_per_hour`, default 200). When it is exhausted the daemon refuses further writes until the window moves on.
+
+Every write-tier call is appended to `~/.telegram-mcp/audit.log` (mode `0600`): UTC timestamp, tool, peer, outcome (`ok`, `error`, `refused:allowlist`, `refused:budget`) and the first 80 characters of any text argument. The file rotates once to `audit.log.1` when it passes 5 MB.
 
 ### File operation safety
 
-- **Uploads (`send_file`):** Restricted to an allowlist of directories (`~/Downloads`, `~/Desktop`, `~/Documents` by default). Symlinks are resolved before checking. Configurable via `config.json`.
-- **Downloads (`download_media`):** Saved to `~/.telegram-mcp/downloads/` by default. No path traversal — filenames are sanitized.
+- **Uploads (`send_file`, `send_voice`, `set_chat_photo`):** Restricted to an allowlist of directories (`~/Downloads`, `~/Desktop`, `~/Documents` by default). Symlinks are resolved before checking. Configurable via `upload_dirs` in `config.json`. There is no size limit beyond Telegram's own.
+- **Downloads (`download_media`, `download_chat_media`):** Saved to `~/.telegram-mcp/downloads/` by default, or to an `output_dir` inside the upload allowlist. The server picks the destination path itself: the Telegram-supplied filename is sanitized, an existing file is never overwritten (a ` (1)`, ` (2)` suffix is added), a symlink at the destination is never followed, and files are created `0600`.
 
-### Export limits
+### Exports
 
-`export_chat` is capped at 1000 messages per call to prevent bulk exfiltration. Requires an explicit chat ID — no "export all chats" option.
+`export_chat` (live, capped at 1000 messages, one chat per call) and `export_cached_messages` (from the cache, JSON or CSV) write the full export to a file in `~/.telegram-mcp/downloads/` and return the path, counts, date range and fenced sender names. Message bodies are not returned to the model.
 
 ### Session protection
 
 - The Telethon session file (`session.session`) contains your full auth state. **Treat it like a password.** Anyone with this file has complete access to your Telegram account.
 - Created with `0600` permissions (owner read/write only).
 - `config.json` stores your API ID and hash, also with `0600` permissions.
-- No passwords or credentials are stored — Telegram uses session-based auth after the initial login.
+- `~/.telegram-mcp/` itself is created `0700`.
+- No passwords or credentials are stored; Telegram uses session-based auth after the initial login.
 
 ### Cache protection
 
@@ -342,14 +368,18 @@ Built-in rate limiting to avoid Telegram API bans:
 
 - Message fetching: max 30 requests per second
 - Search: max 10 requests per second
-- Send/edit/delete: max 20 requests per second
+- Send/edit/delete: max 20 requests per second, and 200 per hour
 - Configurable via `config.json`
+
+### Regex search limits
+
+`search_regex` runs user-supplied patterns against the local cache. Patterns are capped at 256 characters, the scan covers at most 20,000 cached rows, each match is bounded by a 0.25 s timeout and the whole search by 5 s, and the scan runs in a worker thread so an expensive pattern cannot stall the daemon.
 
 ### Input validation
 
-- Chat identifiers are validated before API calls (integer IDs, @usernames, or phone numbers)
+- Chat identifiers are validated before API calls (integer IDs or @usernames)
 - Message content is length-checked against Telegram's 4096 character limit
-- File paths for uploads are validated against the allowlist, checked for symlink traversal, and size-limited
+- File paths for uploads are validated against the allowlist and checked for symlink traversal
 
 ### What this server can access
 
@@ -363,13 +393,26 @@ This server has the same access as your Telegram account. It can read all your c
 {
   "api_id": 12345,
   "api_hash": "your_api_hash",
+  "mode": "full",
+  "send_allowlist": null,
   "rate_limits": {
     "fetch": 30,
     "search": 10,
-    "write": 20
-  }
+    "write": 20,
+    "write_per_hour": 200
+  },
+  "upload_dirs": ["~/Downloads", "~/Desktop", "~/Documents"],
+  "cache_max_age_days": null
 }
 ```
+
+- `mode`: `"read_only"` disables every mutating tool for all sessions. Anything else means full access.
+- `send_allowlist`: list of chat IDs and `@usernames` that sends may target. Omit or `null` to allow all.
+- `rate_limits.write_per_hour`: sliding one-hour cap on write-tier calls.
+- `upload_dirs`: directories files may be sent from.
+- `cache_max_age_days`: prune cached messages older than this on daemon start.
+
+`get_status` reports the installed package version, the git sha when running from a checkout, and the source file's modification time, so a stale install is visible.
 
 ## Development
 
