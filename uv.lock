@@ -283,6 +283,15 @@ wheels = [
 ]
 
 [[package]]
+name = "hachoir"
+version = "3.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/31/e5/3a7d611dc87aab2c088be040f5da2f6937e308044983848e648d97ef388b/hachoir-3.3.0.tar.gz", hash = "sha256:fd7679f649c17ee45ab2ba5eacddc702c667ea5200c0a1fd063d4615fa7270d2", size = 7111887, upload-time = "2023-12-12T10:59:30.986Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ef/96/9570e6604114e9b2b2e1d90a89d01d10646b9cb6f54bba78f6de5fbbceb1/hachoir-3.3.0-py3-none-any.whl", hash = "sha256:9f721af67867d933383398b9605bc388db25f55dde1034d2bfde91f05e5d9910", size = 650439, upload-time = "2023-12-12T10:59:28.091Z" },
+]
+
+[[package]]
 name = "httpcore"
 version = "1.0.9"
 source = { registry = "https://pypi.org/simple" }
@@ -882,6 +891,7 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "cryptg" },
+    { name = "hachoir" },
     { name = "mcp" },
     { name = "telethon" },
 ]
@@ -897,7 +907,8 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "cryptg", specifier = ">=0.4" },
-    { name = "mcp", specifier = ">=1.0" },
+    { name = "hachoir", specifier = ">=3.3" },
+    { name = "mcp", specifier = ">=1.0,<2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11" },

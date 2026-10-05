@@ -20,9 +20,10 @@ classifiers = [
 ]
 dependencies = [
     "telethon>=1.36",
-    "mcp>=1.0",
+    "mcp>=1.0,<2",
     "click>=8.0",
     "cryptg>=0.4",
+    "hachoir>=3.3",
 ]
 
 [project.urls]
