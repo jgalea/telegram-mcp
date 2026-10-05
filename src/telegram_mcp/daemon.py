@@ -27,30 +27,87 @@ import os
 import signal
 from typing import Any
 
-from telegram_mcp._registry import DESTRUCTIVE_TOOLS
+from telegram_mcp._registry import (
+    DESTRUCTIVE_TOOLS,
+    PEER_SEND_TOOLS,
+    WRITE_TOOLS,
+    Policy,
+    is_read_only_tool,
+    load_policy,
+    peer_arg,
+    text_arg,
+)
 from telegram_mcp.client import TelegramMCPClient
 from telegram_mcp.login import CONFIG_DIR
+from telegram_mcp.security import RateLimiter, append_audit
 
 logger = logging.getLogger(__name__)
 
 SOCKET_PATH = os.path.join(CONFIG_DIR, "daemon.sock")
 LOCK_PATH = os.path.join(CONFIG_DIR, "daemon.lock")
+AUDIT_PATH = os.path.join(CONFIG_DIR, "audit.log")
 
-_ALLOWED_TOOLS_CACHE: frozenset[str] | None = None
+_ALL_TOOLS_CACHE: frozenset[str] | None = None
+_POLICY: Policy | None = None
+_WRITE_BUDGET: RateLimiter | None = None
 
 
-def _allowed_tools() -> frozenset[str]:
-    """Return the set of tool names exposed by the MCP.
+def _policy() -> Policy:
+    """Runtime policy, loaded once from config.json and the environment."""
+    global _POLICY
+    if _POLICY is None:
+        _POLICY = load_policy()
+    return _POLICY
+
+
+def _write_budget() -> RateLimiter:
+    global _WRITE_BUDGET
+    if _WRITE_BUDGET is None:
+        _WRITE_BUDGET = RateLimiter(_policy().write_per_hour, 3600.0)
+    return _WRITE_BUDGET
+
+
+def _all_tools() -> frozenset[str]:
+    """Every tool name registered in server.TOOLS.
 
     Lazy-imported to avoid the circular dependency with server.py (which
-    imports SOCKET_PATH from this module). Caching keeps the per-request
-    cost negligible.
+    imports SOCKET_PATH from this module).
     """
-    global _ALLOWED_TOOLS_CACHE
-    if _ALLOWED_TOOLS_CACHE is None:
+    global _ALL_TOOLS_CACHE
+    if _ALL_TOOLS_CACHE is None:
         from telegram_mcp.server import TOOLS  # noqa: PLC0415 — intentional
-        _ALLOWED_TOOLS_CACHE = frozenset(t.name for t in TOOLS)
-    return _ALLOWED_TOOLS_CACHE
+        _ALL_TOOLS_CACHE = frozenset(t.name for t in TOOLS)
+    return _ALL_TOOLS_CACHE
+
+
+def _allowed_tools(read_only: bool | None = None) -> frozenset[str]:
+    """Tool names this daemon will dispatch.
+
+    In read-only mode (config ``mode: read_only``, ``TELEGRAM_MCP_READ_ONLY``
+    in the daemon's environment, or a request tagged ``read_only``) every
+    tool that mutates Telegram state or wipes the cache is removed.
+    """
+    if read_only is None:
+        read_only = _policy().read_only
+    names = _all_tools()
+    if not read_only:
+        return names
+    return frozenset(n for n in names if is_read_only_tool(n))
+
+
+def _audit(tool: str, args: dict[str, Any], status: str) -> None:
+    peer_key = peer_arg(tool)
+    text_key = text_arg(tool)
+    try:
+        append_audit(
+            AUDIT_PATH,
+            tool,
+            args.get(peer_key) if peer_key else None,
+            status,
+            args.get(text_key) if text_key else None,
+        )
+    except Exception:
+        logger.exception("Failed to write audit log entry for %s", tool)
 
 
 class AlreadyRunningError(RuntimeError):
@@ -88,21 +145,33 @@ def _remove_stale_socket() -> None:
 async def _handle_request(client: TelegramMCPClient, payload: dict[str, Any]) -> dict[str, Any]:
     """Dispatch a single {tool, args} payload to the underlying client.
 
-    Two safety gates run before getattr-based dispatch:
+    The safety gates run here, before getattr-based dispatch, so a caller
+    speaking the socket protocol directly cannot bypass them:
 
       1. Whitelist: tool name must appear in the registered TOOLS list.
          Without this, any TelegramMCPClient method would be callable —
          including private ones like _cache_messages (cache poisoning) or
          disconnect (denies service to every concurrent proxy).
 
-      2. Destructive-tool confirm: tools that mutate or destroy state
-         require an explicit confirm=True flag. Lives here (not just in
-         the proxy) so a caller speaking the socket protocol directly
-         cannot bypass the safety gate.
+      2. Read-only mode: write tools are hidden entirely, either daemon-wide
+         (config/env) or for a single request the proxy tagged read_only.
+
+      3. Destructive-tool confirm: requires ``confirm`` to be the JSON
+         boolean true. Truthy strings like "yes" or 1 do not count.
+
+      4. Send allowlist: when config.json sets ``send_allowlist``, any tool
+         that delivers content to a peer outside it is refused.
+
+      5. Hourly write budget: a sliding-window cap on write-tier calls, on
+         top of the per-second limiter inside the client.
+
+    Every write-tier call, including refusals at gates 4 and 5, is appended
+    to the audit log.
     """
     req_id = payload.get("id")
     tool = payload.get("tool")
     args = payload.get("args") or {}
+    request_read_only = payload.get("read_only") is True
 
     if not isinstance(tool, str):
         return {"id": req_id, "error": "missing or invalid 'tool'"}
@@ -110,9 +179,13 @@ async def _handle_request(client: TelegramMCPClient, payload: dict[str, Any]) ->
         return {"id": req_id, "error": "'args' must be an object"}
 
     if tool not in _allowed_tools():
+        if tool in _all_tools():
+            return {"id": req_id, "error": f"'{tool}' is disabled: daemon is in read-only mode"}
         return {"id": req_id, "error": f"unknown tool: {tool}"}
+    if request_read_only and not is_read_only_tool(tool):
+        return {"id": req_id, "error": f"'{tool}' is disabled: session is in read-only mode"}
 
-    if tool in DESTRUCTIVE_TOOLS and not args.get("confirm"):
+    if tool in DESTRUCTIVE_TOOLS and args.get("confirm") is not True:
         return {
             "id": req_id,
             "result": {
@@ -129,16 +202,46 @@ async def _handle_request(client: TelegramMCPClient, payload: dict[str, Any]) ->
         return {"id": req_id, "error": f"unknown tool: {tool}"}
 
     call_args = {k: v for k, v in args.items() if k != "confirm"}
+    is_write = tool in WRITE_TOOLS
+
+    if is_write and tool in PEER_SEND_TOOLS:
+        peer = call_args.get(PEER_SEND_TOOLS[tool])
+        if not _policy().peer_allowed(peer):
+            _audit(tool, call_args, "refused:allowlist")
+            return {
+                "id": req_id,
+                "error": f"'{tool}' refused: recipient is not in send_allowlist",
+            }
+
+    if is_write:
+        try:
+            _write_budget().acquire()
+        except RuntimeError:
+            _audit(tool, call_args, "refused:budget")
+            return {
+                "id": req_id,
+                "error": (
+                    f"'{tool}' refused: hourly write budget of"
+                    f" {_policy().write_per_hour} calls exhausted"
+                ),
+            }
 
     try:
         await client.ensure_connected()
         result = await method(**call_args)
-        return {"id": req_id, "result": result}
     except TypeError as e:
+        if is_write:
+            _audit(tool, call_args, "error:bad_args")
         return {"id": req_id, "error": f"bad args for {tool}: {e}"}
     except Exception as e:
         logger.exception("Tool %s failed", tool)
+        if is_write:
+            _audit(tool, call_args, "error")
         return {"id": req_id, "error": str(e)}
+
+    if is_write:
+        _audit(tool, call_args, "ok")
+    return {"id": req_id, "result": result}
 
 
 def _make_handler(client: TelegramMCPClient):
@@ -185,7 +288,14 @@ async def serve_daemon() -> None:
     finally:
         os.umask(old_umask)
     os.chmod(SOCKET_PATH, 0o600)
-    logger.info("telegram-mcp daemon listening on %s (pid=%d)", SOCKET_PATH, os.getpid())
+    policy = _policy()
+    logger.info(
+        "telegram-mcp daemon listening on %s (pid=%d, read_only=%s, send_allowlist=%s,"
+        " write_per_hour=%d)",
+        SOCKET_PATH, os.getpid(), policy.read_only,
+        "off" if policy.send_allowlist is None else f"{len(policy.send_allowlist)} peers",
+        policy.write_per_hour,
+    )
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

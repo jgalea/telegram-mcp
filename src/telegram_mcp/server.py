@@ -15,17 +15,37 @@ import os
 import signal
 import subprocess
 import sys
+from logging.handlers import RotatingFileHandler
 from typing import Any
 
 import click
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
 
-from telegram_mcp._registry import DESTRUCTIVE_TOOLS
+from telegram_mcp._registry import (
+    DESTRUCTIVE_TOOLS,
+    LOCAL_ONLY_TOOLS,
+    READ_ONLY_ENV,
+    is_read_only_tool,
+    load_policy,
+)
 from telegram_mcp.daemon import SOCKET_PATH
 
 logger = logging.getLogger(__name__)
+
+DAEMON_LOG_MAX_BYTES = 5 * 1024 * 1024
+DAEMON_LOG_BACKUPS = 2
+
+_READ_ONLY: bool | None = None
+
+
+def _read_only() -> bool:
+    """Whether this proxy session is read-only (config ``mode`` or env var)."""
+    global _READ_ONLY
+    if _READ_ONLY is None:
+        _READ_ONLY = load_policy().read_only
+    return _READ_ONLY
 
 
 def _spawn_daemon() -> None:
@@ -38,12 +58,20 @@ def _spawn_daemon() -> None:
     Daemon stdout+stderr are appended to ~/.telegram-mcp/daemon.log so crashes
     during Telethon connect are diagnosable. Without this, a daemon that died
     on startup left no trace and looked indistinguishable from "server fine".
+
+    TELEGRAM_MCP_READ_ONLY is scoped to the session that set it, so it is
+    stripped from the child's environment: the daemon is shared by every
+    session on the machine, and a read-only session must not silently turn
+    the daemon read-only for all of them. Machine-wide read-only belongs in
+    config.json (``"mode": "read_only"``). Read-only sessions still tag each
+    request so the daemon refuses write tools for them.
     """
     from telegram_mcp.login import CONFIG_DIR  # noqa: PLC0415
 
     log_path = os.path.join(CONFIG_DIR, "daemon.log")
-    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    env = {k: v for k, v in os.environ.items() if k != READ_ONLY_ENV}
     try:
         cmd = [sys.argv[0], "daemon"]
         subprocess.Popen(
@@ -53,6 +81,7 @@ def _spawn_daemon() -> None:
             stderr=log_fd,
             start_new_session=True,
             close_fds=True,
+            env=env,
         )
     finally:
         os.close(log_fd)
@@ -97,7 +126,9 @@ async def _call_daemon(tool: str, args: dict[str, Any], timeout: float = 120.0) 
         reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
 
     try:
-        payload = json.dumps({"id": 1, "tool": tool, "args": args}, default=str)
+        payload = json.dumps(
+            {"id": 1, "tool": tool, "args": args, "read_only": _read_only()}, default=str
+        )
         writer.write(payload.encode("utf-8") + b"\n")
         await writer.drain()
         line = await asyncio.wait_for(reader.readline(), timeout=timeout)
@@ -117,6 +148,66 @@ async def _call_daemon(tool: str, args: dict[str, Any], timeout: float = 120.0) 
 
 
 app = Server("telegram-mcp")
+
+# MCP annotation hints per tool: (readOnlyHint, destructiveHint, idempotentHint).
+# openWorldHint is False for LOCAL_ONLY_TOOLS and True otherwise. Every tool
+# must be listed; _tool() raises KeyError for an unclassified name.
+_READ = (True, False, True)
+_HINTS: dict[str, tuple[bool, bool, bool]] = {
+    # Pure reads (the write-through cache is an internal detail)
+    "list_chats": _READ, "get_chat_info": _READ, "read_messages": _READ,
+    "search_messages": _READ, "search_regex": _READ, "get_message": _READ,
+    "get_message_replies": _READ, "get_scheduled_messages": _READ,
+    "get_sticker_sets": _READ, "list_contacts": _READ, "get_contact": _READ,
+    "get_user": _READ, "get_participants": _READ, "list_forum_topics": _READ,
+    "get_admin_log": _READ, "get_me": _READ, "get_status": _READ,
+    "get_dialogs_stats": _READ, "get_new_messages": _READ, "chat_analytics": _READ,
+    "message_timeline": _READ, "today_messages": _READ, "sync_messages": _READ,
+    # Read Telegram, but write files to local disk
+    "download_media": (False, False, False),
+    "download_chat_media": (False, False, False),
+    "export_chat": (False, False, False),
+    "export_cached_messages": (False, False, False),
+    # Writes that add or toggle state
+    "send_message": (False, False, False),
+    "schedule_message": (False, False, False),
+    "send_file": (False, False, False),
+    "send_voice": (False, False, False),
+    "send_location": (False, False, False),
+    "forward_message": (False, False, False),
+    "edit_message": (False, False, True),
+    "send_reaction": (False, False, True),
+    "pin_message": (False, False, True),
+    "unpin_message": (False, False, True),
+    "archive_chat": (False, False, True),
+    "mute_chat": (False, False, True),
+    "mark_read": (False, False, True),
+    "unblock_user": (False, False, True),
+    "add_participant": (False, False, True),
+    "get_invite_link": (False, False, False),
+    "create_group": (False, False, False),
+    "create_channel": (False, False, False),
+    "set_chat_title": (False, False, True),
+    "set_chat_description": (False, False, True),
+    "set_chat_photo": (False, False, True),
+    # Writes that remove or destroy state
+    "delete_chat": (False, True, True),
+    "leave_chat": (False, True, True),
+    "delete_message": (False, True, True),
+    "block_user": (False, True, True),
+    "remove_participant": (False, True, True),
+    "clear_cache": (False, True, True),
+}
+
+
+def _annotations(name: str) -> ToolAnnotations:
+    read_only, destructive, idempotent = _HINTS[name]
+    return ToolAnnotations(
+        readOnlyHint=read_only,
+        destructiveHint=destructive,
+        idempotentHint=idempotent,
+        openWorldHint=name not in LOCAL_ONLY_TOOLS,
+    )
 
 
 def _tool(
@@ -138,7 +229,9 @@ def _tool(
             ),
         }
         description += " (DESTRUCTIVE: requires confirm=true)"
-    return Tool(name=name, description=description, inputSchema=schema)
+    return Tool(
+        name=name, description=description, inputSchema=schema, annotations=_annotations(name)
+    )
 
 
 def _text(data: Any) -> list[TextContent]:
@@ -734,13 +827,24 @@ TOOLS = [
 ]
 
 
+def visible_tools(read_only: bool | None = None) -> list[Tool]:
+    """Tools this session exposes: everything, or only non-mutating ones in read-only mode."""
+    if read_only is None:
+        read_only = _read_only()
+    if not read_only:
+        return TOOLS
+    return [t for t in TOOLS if is_read_only_tool(t.name)]
+
+
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    return TOOLS
+    return visible_tools()
 
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    if name not in {t.name for t in visible_tools()}:
+        raise RuntimeError(f"Tool '{name}' is not available in this session")
     try:
         result = await asyncio.wait_for(_call_daemon(name, arguments), timeout=120)
     except asyncio.TimeoutError as e:
@@ -809,12 +913,46 @@ def serve_cmd():
     asyncio.run(serve())
 
 
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler whose files are created 0600 instead of umask-default."""
+
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        return os.fdopen(fd, self.mode, encoding=self.encoding)
+
+
+def configure_daemon_logging(log_path: str) -> logging.Handler:
+    """Log to *log_path* with size-based rotation; quieten Telethon to WARNING.
+
+    Telethon at INFO logs every reconnect and update, which is what made
+    daemon.log grow without bound. Rotation caps the file at
+    DAEMON_LOG_MAX_BYTES with DAEMON_LOG_BACKUPS older generations kept.
+    """
+    handler = _PrivateRotatingFileHandler(
+        log_path, maxBytes=DAEMON_LOG_MAX_BYTES, backupCount=DAEMON_LOG_BACKUPS
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    if sys.stderr.isatty():
+        # Foreground run from a terminal: mirror to the console too. When
+        # spawned by the proxy, stderr is already the log file.
+        console = logging.StreamHandler()
+        console.setFormatter(handler.formatter)
+        root.addHandler(console)
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    return handler
+
+
 @main_cli.command("daemon")
 def daemon_cmd():
     """Run the long-lived Telethon daemon in the foreground."""
     from telegram_mcp.daemon import AlreadyRunningError, serve_daemon
+    from telegram_mcp.login import CONFIG_DIR
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    configure_daemon_logging(os.path.join(CONFIG_DIR, "daemon.log"))
     try:
         asyncio.run(serve_daemon())
     except AlreadyRunningError as e:

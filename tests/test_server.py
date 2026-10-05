@@ -176,3 +176,181 @@ class TestTerminalSignalDetachment:
         finally:
             for sig, handler in prev.items():
                 signal.signal(sig, handler)
+
+
+class TestToolAnnotations:
+    def test_every_tool_has_all_four_hints(self):
+        for tool in TOOLS:
+            ann = tool.annotations
+            assert ann is not None, f"{tool.name} has no annotations"
+            for hint in ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"):
+                assert isinstance(getattr(ann, hint), bool), f"{tool.name}.{hint} unset"
+
+    def test_write_tools_are_not_marked_read_only(self):
+        from telegram_mcp._registry import WRITE_TOOLS
+
+        for tool in TOOLS:
+            if tool.name in WRITE_TOOLS or tool.name == "clear_cache":
+                assert tool.annotations.readOnlyHint is False, tool.name
+
+    def test_read_only_hint_implies_allowed_in_read_only_mode(self):
+        from telegram_mcp._registry import is_read_only_tool
+
+        for tool in TOOLS:
+            if tool.annotations.readOnlyHint:
+                assert is_read_only_tool(tool.name), tool.name
+
+    def test_pure_reads_are_marked_read_only(self):
+        for name in ("list_chats", "read_messages", "search_messages", "get_me", "get_status",
+                     "search_regex", "get_participants", "list_forum_topics"):
+            tool = next(t for t in TOOLS if t.name == name)
+            assert tool.annotations.readOnlyHint is True, name
+            assert tool.annotations.destructiveHint is False, name
+
+    def test_removal_tools_are_destructive(self):
+        for name in ("delete_chat", "leave_chat", "delete_message", "block_user",
+                     "remove_participant", "clear_cache"):
+            tool = next(t for t in TOOLS if t.name == name)
+            assert tool.annotations.destructiveHint is True, name
+
+    def test_local_tools_are_closed_world(self):
+        from telegram_mcp._registry import LOCAL_ONLY_TOOLS
+
+        for tool in TOOLS:
+            expected = tool.name not in LOCAL_ONLY_TOOLS
+            assert tool.annotations.openWorldHint is expected, tool.name
+
+    def test_disk_writers_are_not_read_only(self):
+        for name in ("download_media", "download_chat_media", "export_chat",
+                     "export_cached_messages"):
+            tool = next(t for t in TOOLS if t.name == name)
+            assert tool.annotations.readOnlyHint is False, name
+            assert tool.annotations.destructiveHint is False, name
+
+    def test_annotations_survive_serialisation(self):
+        dumped = TOOLS[0].model_dump(exclude_none=True)
+        assert set(dumped["annotations"]) == {
+            "readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"
+        }
+
+
+class TestReadOnlyProxy:
+    def test_visible_tools_filters_writes(self):
+        from telegram_mcp._registry import WRITE_TOOLS
+        from telegram_mcp.server import visible_tools
+
+        assert visible_tools(read_only=False) is TOOLS
+        ro_names = {t.name for t in visible_tools(read_only=True)}
+        assert not (ro_names & WRITE_TOOLS)
+        assert "clear_cache" not in ro_names
+        assert "list_chats" in ro_names and "read_messages" in ro_names
+
+    def test_list_tools_honours_env(self, monkeypatch):
+        from telegram_mcp.server import list_tools
+
+        monkeypatch.setattr(server_module, "_READ_ONLY", True)
+        names = {t.name for t in asyncio.run(list_tools())}
+        assert "send_message" not in names and "list_chats" in names
+
+        monkeypatch.setattr(server_module, "_READ_ONLY", False)
+        assert len(asyncio.run(list_tools())) == len(TOOLS)
+
+    def test_call_tool_refuses_hidden_tool(self, monkeypatch):
+        called = []
+
+        async def fake_call_daemon(tool, args, timeout=120.0):
+            called.append(tool)
+            return {}
+
+        monkeypatch.setattr(server_module, "_call_daemon", fake_call_daemon)
+        monkeypatch.setattr(server_module, "_READ_ONLY", True)
+        with pytest.raises(RuntimeError, match="not available"):
+            asyncio.run(call_tool("send_message", {"chat_id": 1, "text": "x"}))
+        assert called == []
+
+    def test_request_payload_carries_read_only_flag(self, monkeypatch, tmp_path):
+        """The proxy tags every request so the daemon enforces per session."""
+        import json
+        import os
+        import tempfile
+        import uuid
+
+        monkeypatch.setattr(server_module, "_READ_ONLY", True)
+        # Short path: macOS caps AF_UNIX paths at 104 chars, tmp_path is longer
+        sock = os.path.join(tempfile.gettempdir(), f"tg-mcp-{uuid.uuid4().hex[:8]}.sock")
+        monkeypatch.setattr(server_module, "SOCKET_PATH", sock)
+        seen = []
+
+        async def handler(reader, writer):
+            seen.append(json.loads(await reader.readline()))
+            writer.write(b'{"id": 1, "result": "ok"}\n')
+            await writer.drain()
+            writer.close()
+
+        async def run():
+            server = await asyncio.start_unix_server(handler, path=sock)
+            try:
+                return await server_module._call_daemon("get_me", {})
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        try:
+            assert asyncio.run(run()) == "ok"
+        finally:
+            if os.path.exists(sock):
+                os.unlink(sock)
+        assert seen[0]["read_only"] is True
+
+
+class TestSpawnDaemonHygiene:
+    def test_config_dir_created_0700_and_env_stripped(self, monkeypatch, tmp_path):
+        import os
+        import stat
+
+        cfg = tmp_path / "cfg"
+        monkeypatch.setattr("telegram_mcp.login.CONFIG_DIR", str(cfg))
+        monkeypatch.setenv("TELEGRAM_MCP_READ_ONLY", "1")
+        monkeypatch.setenv("KEEP_ME", "yes")
+        popen_calls = []
+
+        def fake_popen(cmd, **kwargs):
+            popen_calls.append(kwargs)
+
+        monkeypatch.setattr(server_module.subprocess, "Popen", fake_popen)
+        server_module._spawn_daemon()
+
+        assert stat.S_IMODE(os.stat(cfg).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(cfg / "daemon.log").st_mode) == 0o600
+        env = popen_calls[0]["env"]
+        assert "TELEGRAM_MCP_READ_ONLY" not in env
+        assert env["KEEP_ME"] == "yes"
+
+
+class TestDaemonLogging:
+    def test_rotating_handler_and_quiet_telethon(self, tmp_path):
+        import logging
+        import os
+        from logging.handlers import RotatingFileHandler
+
+        root = logging.getLogger()
+        before = list(root.handlers)
+        telethon_before = logging.getLogger("telethon").level
+        log_path = str(tmp_path / "daemon.log")
+        try:
+            handler = server_module.configure_daemon_logging(log_path)
+            assert isinstance(handler, RotatingFileHandler)
+            assert handler.maxBytes == server_module.DAEMON_LOG_MAX_BYTES > 0
+            assert handler.backupCount >= 1
+            assert logging.getLogger("telethon").level == logging.WARNING
+            assert logging.getLogger("telethon").isEnabledFor(logging.INFO) is False
+            logging.getLogger("telegram_mcp.test").info("hello log")
+            handler.flush()
+            assert "hello log" in open(log_path).read()
+            assert oct(os.stat(log_path).st_mode & 0o777) == "0o600"
+        finally:
+            for h in list(root.handlers):
+                if h not in before:
+                    root.removeHandler(h)
+                    h.close()
+            logging.getLogger("telethon").setLevel(telethon_before)
