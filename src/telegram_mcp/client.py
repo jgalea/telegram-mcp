@@ -8,8 +8,6 @@ import os
 from datetime import datetime
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 from telethon import TelegramClient
 from telethon.tl.functions.channels import (
     EditBannedRequest,
@@ -42,17 +40,39 @@ from telethon.tl.types import (
     User,
 )
 
-from telegram_mcp.cache import MessageCache
+from telegram_mcp.cache import (
+    MessageCache,
+    compile_search_pattern,
+    regex_filter,
+)
 from telegram_mcp.login import CONFIG_DIR, DOWNLOADS_DIR, SESSION_PATH, load_config
 from telegram_mcp.security import (
     RateLimiter,
+    create_unique_file,
     ensure_dir,
     fence,
     is_path_allowed,
-    sanitize_filename,
     validate_chat_id,
     validate_message_length,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _forward_info(msg: Message) -> tuple[str | None, int | None]:
+    """(display name, peer id) of the original sender of a forwarded message."""
+    fwd = getattr(msg, "fwd_from", None)
+    if fwd is None:
+        return None, None
+    name = getattr(fwd, "from_name", None) or getattr(fwd, "post_author", None)
+    peer = getattr(fwd, "from_id", None)
+    peer_id = None
+    for attr in ("user_id", "channel_id", "chat_id"):
+        val = getattr(peer, attr, None)
+        if isinstance(val, int):
+            peer_id = val
+            break
+    return (name if isinstance(name, str) else None), peer_id
 
 
 def _msg_to_dict(msg: Message) -> dict[str, Any]:
@@ -79,7 +99,9 @@ def _msg_to_dict(msg: Message) -> dict[str, Any]:
         else:
             media_type = type(msg.media).__name__
 
-    return {
+    forward_from, forward_from_id = _forward_info(msg)
+
+    result = {
         "id": msg.id,
         "chat_id": msg.chat_id,
         "sender_id": sender_id,
@@ -90,14 +112,95 @@ def _msg_to_dict(msg: Message) -> dict[str, Any]:
         "media_type": media_type,
         "edited": msg.edit_date.isoformat() if msg.edit_date else None,
     }
+    if forward_from is not None or forward_from_id is not None:
+        result["forward_from"] = forward_from
+        result["forward_from_id"] = forward_from_id
+    return result
 
 
 def _fence_message(msg_dict: dict[str, Any]) -> dict[str, Any]:
-    """Apply content fencing to a message dict."""
-    return {
+    """Apply content fencing to a message dict.
+
+    The text of a media message is its caption, so it gets the CAPTION label.
+    """
+    text_label = "caption" if msg_dict.get("media_type") else "message"
+    fenced = {
         **msg_dict,
-        "text": fence(msg_dict.get("text"), "message"),
+        "text": fence(msg_dict.get("text"), text_label),
         "sender_name": fence(msg_dict.get("sender_name"), "sender"),
+    }
+    if "forward_from" in msg_dict:
+        fenced["forward_from"] = fence(msg_dict.get("forward_from"), "forward")
+    return fenced
+
+
+def _export_summary(messages: list[dict[str, Any]], path: str, fmt: str) -> dict[str, Any]:
+    """What an export tool returns: where the file is, plus fenced metadata."""
+    dates = [m.get("date") for m in messages if m.get("date")]
+    senders = sorted({m.get("sender_name") for m in messages if m.get("sender_name")})
+    return {
+        "path": path,
+        "format": fmt,
+        "count": len(messages),
+        "date_from": min(dates) if dates else None,
+        "date_to": max(dates) if dates else None,
+        "senders": [fence(s, "sender") for s in senders[:50]],
+        "note": (
+            "Full export written to disk. Message bodies are not returned to the model;"
+            " read the file with a tool of your own if you need them."
+        ),
+    }
+
+
+def _export_filename(prefix: str, ext: str) -> str:
+    return f"{prefix}_{datetime.now().strftime('%Y%m%dT%H%M%S')}.{ext}"
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _package_info() -> dict[str, Any]:
+    """Version, source location and build time of the running code.
+
+    Makes a stale install visible: the tool is often reinstalled from a
+    local checkout without a version bump, so the git sha (when the code
+    runs from a checkout) and the on-disk mtime of this file are what
+    actually change between installs.
+    """
+    import importlib.metadata as md  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    try:
+        version = md.version("telegram-mcp-jgalea")
+    except md.PackageNotFoundError:
+        version = "unknown"
+
+    source_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(__file__)).isoformat(timespec="seconds")
+    except OSError:
+        mtime = None
+
+    git_sha = None
+    try:
+        out = subprocess.run(
+            ["git", "-C", source_dir, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode == 0:
+            git_sha = out.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    return {
+        "version": version,
+        "git_sha": git_sha,
+        "source_dir": source_dir,
+        "source_mtime": mtime,
     }
 
 
@@ -414,15 +517,25 @@ class TelegramMCPClient:
         self, pattern: str, chat_id: int | str | None = None, limit: int = 20,
         after: str | None = None, before: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Search cached messages using a regex pattern."""
+        """Search cached messages using a regex pattern.
+
+        The SQL fetch runs on the event loop (fast, bounded by the row cap);
+        the regex scan runs in a worker thread with a per-row and total
+        timeout so an expensive pattern can't stall the daemon.
+        """
+        import asyncio  # noqa: PLC0415
+
         resolved_chat_id = None
         if chat_id:
             chat_id = validate_chat_id(chat_id)
             resolved_chat_id = chat_id if isinstance(chat_id, int) else None
 
-        results = self._cache.search_regex(
-            pattern, chat_id=resolved_chat_id, limit=limit, after=after, before=before,
+        compiled = compile_search_pattern(pattern)
+        rows = self._cache.regex_candidates(
+            chat_id=resolved_chat_id, after=after, before=before,
         )
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, regex_filter, rows, compiled, limit)
         return [_fence_message(m) for m in results]
 
     async def get_message(self, chat_id: int | str, message_id: int) -> dict[str, Any]:
@@ -452,7 +565,7 @@ class TelegramMCPClient:
         chat_id = validate_chat_id(chat_id)
         entity = await self._client.get_input_entity(chat_id)
         result = await self._client(GetScheduledHistoryRequest(peer=entity, hash=0))
-        return [_msg_to_dict(m) for m in result.messages if isinstance(m, Message)]
+        return [_fence_message(_msg_to_dict(m)) for m in result.messages if isinstance(m, Message)]
 
     # --- Messages: Write ---
 
@@ -546,21 +659,48 @@ class TelegramMCPClient:
 
     # --- Media ---
 
+    async def _download_to_dir(self, msg: Message, target_dir: str) -> dict[str, str]:
+        """Download *msg*'s media into *target_dir* without clobbering anything.
+
+        The destination is created by us with O_EXCL|O_NOFOLLOW (see
+        create_unique_file) and handed to Telethon as an open file, so
+        Telethon never picks the name, never overwrites an existing file,
+        and never writes through a symlink. The original filename is
+        attacker-controlled and is returned fenced.
+        """
+        original = getattr(getattr(msg, "file", None), "name", None)
+        ext = getattr(getattr(msg, "file", None), "ext", None) or ""
+        kind = "photo" if isinstance(msg.media, MessageMediaPhoto) else "file"
+        wanted = original if isinstance(original, str) and original else f"{kind}_{msg.id}{ext}"
+        if not os.path.splitext(wanted)[1] and ext:
+            wanted += ext
+
+        fd, final_path = create_unique_file(target_dir, wanted)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                written = await self._client.download_media(msg, file=fh)
+        except BaseException:
+            _unlink_quietly(final_path)
+            raise
+        if written is None:
+            _unlink_quietly(final_path)
+            raise ValueError("Failed to download media")
+
+        basename = os.path.basename(final_path)
+        return {
+            "dir": target_dir,
+            "path": fence(final_path, "filename"),
+            "filename": fence(basename, "filename"),
+            "original_filename": fence(original, "filename"),
+        }
+
     async def download_media(self, chat_id: int | str, message_id: int) -> dict[str, str]:
         self._rl_fetch.acquire()
         chat_id = validate_chat_id(chat_id)
         msg = await self._client.get_messages(chat_id, ids=message_id)
         if not msg or not msg.media:
             raise ValueError("Message has no media")
-        path = await self._client.download_media(msg, file=DOWNLOADS_DIR)
-        if path:
-            # Sanitize the downloaded filename
-            basename = sanitize_filename(os.path.basename(path))
-            final_path = os.path.join(DOWNLOADS_DIR, basename)
-            if path != final_path:
-                os.rename(path, final_path)
-            return {"path": final_path, "filename": basename}
-        raise ValueError("Failed to download media")
+        return await self._download_to_dir(msg, DOWNLOADS_DIR)
 
     async def download_chat_media(
         self, chat_id: int | str, limit: int = 50,
@@ -597,19 +737,9 @@ class TelegramMCPClient:
                 continue
 
             try:
-                path = await self._client.download_media(msg, file=target_dir)
-                if path:
-                    basename = sanitize_filename(os.path.basename(path))
-                    final_path = os.path.join(target_dir, basename)
-                    if path != final_path:
-                        os.rename(path, final_path)
-                    results.append({
-                        "msg_id": msg.id,
-                        "media_type": classified,
-                        "path": final_path,
-                        "filename": basename,
-                    })
-                    downloaded += 1
+                info = await self._download_to_dir(msg, target_dir)
+                results.append({"msg_id": msg.id, "media_type": classified, **info})
+                downloaded += 1
             except Exception as e:
                 results.append({
                     "msg_id": msg.id,
@@ -858,7 +988,12 @@ class TelegramMCPClient:
     async def get_status(self) -> dict[str, Any]:
         connected = self._client.is_connected()
         authorized = await self._client.is_user_authorized() if connected else False
-        return {"connected": connected, "authorized": authorized}
+        return {
+            "connected": connected,
+            "authorized": authorized,
+            "daemon_pid": os.getpid(),
+            **_package_info(),
+        }
 
     async def get_dialogs_stats(self) -> dict[str, Any]:
         self._rl_fetch.acquire()
@@ -872,14 +1007,24 @@ class TelegramMCPClient:
 
     async def export_chat(
         self, chat_id: int | str, limit: int = 1000,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
+        """Export a chat live from Telegram to a JSON file in the downloads dir.
+
+        The raw messages go to disk for the user; the model gets the path
+        and a fenced summary, never the unfenced bodies.
+        """
         self._rl_fetch.acquire()
         chat_id = validate_chat_id(chat_id)
         limit = min(limit, 1000)  # Hard cap
         messages = await self._client.get_messages(chat_id, limit=limit)
         result = [_msg_to_dict(m) for m in messages if isinstance(m, Message)]
         self._cache_messages(result)
-        return result  # Unfenced — export is for the user's own data
+
+        ensure_dir(DOWNLOADS_DIR)
+        fd, path = create_unique_file(DOWNLOADS_DIR, _export_filename("export_chat", "json"))
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(result, indent=2, default=str))
+        return _export_summary(result, path, "json")
 
     async def clear_cache(self) -> dict[str, str]:
         self._cache.clear()
@@ -924,7 +1069,7 @@ class TelegramMCPClient:
         self._cache.cache_chat(entity.id, chat_name, chat_type)
         return {
             "chat_id": entity.id,
-            "chat_name": chat_name,
+            "chat_name": fence(chat_name, "title"),
             "messages_synced": total_fetched,
         }
 
@@ -976,7 +1121,7 @@ class TelegramMCPClient:
             total_messages += chat_count
             results.append({
                 "chat_id": d.entity.id,
-                "chat_name": d.name,
+                "chat_name": fence(d.name, "title"),
                 "messages_synced": chat_count,
             })
 
@@ -1073,7 +1218,14 @@ class TelegramMCPClient:
         after: str | None = None, before: str | None = None,
         format: str = "json",
     ) -> dict[str, Any]:
-        """Export cached messages as JSON or CSV."""
+        """Export cached messages as a JSON or CSV file in the downloads dir.
+
+        Like export_chat, the raw rows go to disk and the model gets the
+        path plus a fenced summary.
+        """
+        if format not in ("json", "csv"):
+            raise ValueError(f"Invalid format: {format}. Must be json or csv.")
+
         resolved_chat_id = None
         if chat_id:
             chat_id = validate_chat_id(chat_id)
@@ -1084,13 +1236,19 @@ class TelegramMCPClient:
         )
 
         if format == "csv":
-            import csv
-            import io
+            import csv  # noqa: PLC0415
+            import io  # noqa: PLC0415
             output = io.StringIO()
             if messages:
                 writer = csv.DictWriter(output, fieldnames=messages[0].keys())
                 writer.writeheader()
                 writer.writerows(messages)
-            return {"format": "csv", "count": len(messages), "data": output.getvalue()}
+            data = output.getvalue()
+        else:
+            data = json.dumps(messages, indent=2, default=str)
 
-        return {"format": "json", "count": len(messages), "messages": messages}
+        ensure_dir(DOWNLOADS_DIR)
+        fd, path = create_unique_file(DOWNLOADS_DIR, _export_filename("export_cached", format))
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        return _export_summary(messages, path, format)
