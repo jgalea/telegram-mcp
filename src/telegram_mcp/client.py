@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 from typing import Any
 
-from telethon import TelegramClient
+from telethon import TelegramClient, utils
 from telethon.tl.functions.channels import (
     EditBannedRequest,
     EditPhotoRequest,
@@ -132,6 +132,18 @@ def _fence_message(msg_dict: dict[str, Any]) -> dict[str, Any]:
     if "forward_from" in msg_dict:
         fenced["forward_from"] = fence(msg_dict.get("forward_from"), "forward")
     return fenced
+
+
+def _cache_only_chat_id(chat_id: int | str | None) -> int | None:
+    """Never turn an unresolved username scope into an unscoped cache query."""
+    if chat_id is None:
+        return None
+    normalized = validate_chat_id(chat_id)
+    if not isinstance(normalized, int):
+        raise ValueError(
+            "Cache-only tools require a numeric chat_id; use list_chats to find the chat ID"
+        )
+    return normalized
 
 
 def _export_summary(messages: list[dict[str, Any]], path: str, fmt: str) -> dict[str, Any]:
@@ -468,12 +480,14 @@ class TelegramMCPClient:
     ) -> list[dict[str, Any]]:
         self._rl_search.acquire()
         kwargs: dict[str, Any] = {"limit": min(limit, 100)}
+        cached_chat_id: int | None = None
+        cached_chat_ids: list[int] | None = None
 
         if chat_type and chat_type not in ("user", "group", "channel"):
             raise ValueError(f"Invalid chat_type: {chat_type}. Must be user, group, or channel.")
 
         # When filtering by chat_type, search across matching chats
-        if chat_type and not chat_id:
+        if chat_type and chat_id is None:
             dialogs = await self._client.get_dialogs(limit=200)
             matching_entities = []
             for d in dialogs:
@@ -485,6 +499,7 @@ class TelegramMCPClient:
                 if dtype == chat_type:
                     matching_entities.append(d.entity)
 
+            cached_chat_ids = [utils.get_peer_id(entity) for entity in matching_entities]
             live_results: list[dict[str, Any]] = []
             for ent in matching_entities:
                 msgs = await self._client.get_messages(ent, search=query, **kwargs)
@@ -494,9 +509,12 @@ class TelegramMCPClient:
             self._cache_messages(live_results)
         else:
             entity = None
-            if chat_id:
+            if chat_id is not None:
                 chat_id = validate_chat_id(chat_id)
                 entity = await self._client.get_entity(chat_id)
+                # Telethon message.chat_id stores the marked peer ID, not the
+                # bare Channel/Chat entity ID or the user's @username.
+                cached_chat_id = utils.get_peer_id(entity)
 
             # Live search
             messages = await self._client.get_messages(entity, search=query, **kwargs)
@@ -505,10 +523,12 @@ class TelegramMCPClient:
 
         # Merge with cache
         cache_results = self._cache.search(
-            query, chat_id=chat_id if isinstance(chat_id, int) else None, limit=limit
+            query, chat_id=cached_chat_id, chat_ids=cached_chat_ids, limit=limit
         )
-        live_ids = {m["id"] for m in live_results}
-        merged = live_results + [c for c in cache_results if c["id"] not in live_ids]
+        live_keys = {(m["chat_id"], m["id"]) for m in live_results}
+        merged = live_results + [
+            c for c in cache_results if (c["chat_id"], c["id"]) not in live_keys
+        ]
         merged.sort(key=lambda m: m.get("date", ""), reverse=True)
 
         return [_fence_message(m) for m in merged[:limit]]
@@ -525,10 +545,7 @@ class TelegramMCPClient:
         """
         import asyncio  # noqa: PLC0415
 
-        resolved_chat_id = None
-        if chat_id:
-            chat_id = validate_chat_id(chat_id)
-            resolved_chat_id = chat_id if isinstance(chat_id, int) else None
+        resolved_chat_id = _cache_only_chat_id(chat_id)
 
         compiled = compile_search_pattern(pattern)
         rows = self._cache.regex_candidates(
@@ -1148,10 +1165,7 @@ class TelegramMCPClient:
         after: str | None = None, before: str | None = None,
     ) -> dict[str, Any]:
         """Return message counts grouped by time period from the cache."""
-        resolved_chat_id = None
-        if chat_id:
-            chat_id = validate_chat_id(chat_id)
-            resolved_chat_id = chat_id if isinstance(chat_id, int) else None
+        resolved_chat_id = _cache_only_chat_id(chat_id)
 
         entries = self._cache.timeline(
             chat_id=resolved_chat_id, granularity=granularity,
@@ -1163,10 +1177,7 @@ class TelegramMCPClient:
         self, chat_id: int | str | None = None, limit: int = 200,
     ) -> list[dict[str, Any]]:
         """Return today's messages from the cache."""
-        resolved_chat_id = None
-        if chat_id:
-            chat_id = validate_chat_id(chat_id)
-            resolved_chat_id = chat_id if isinstance(chat_id, int) else None
+        resolved_chat_id = _cache_only_chat_id(chat_id)
 
         results = self._cache.get_today(chat_id=resolved_chat_id, limit=limit)
         return [_fence_message(m) for m in results]
@@ -1209,10 +1220,7 @@ class TelegramMCPClient:
         after: str | None = None, before: str | None = None,
     ) -> dict[str, Any]:
         """Return analytics for a chat: top senders and message counts from cache."""
-        resolved_chat_id = None
-        if chat_id:
-            chat_id = validate_chat_id(chat_id)
-            resolved_chat_id = chat_id if isinstance(chat_id, int) else None
+        resolved_chat_id = _cache_only_chat_id(chat_id)
 
         top = self._cache.top_senders(
             chat_id=resolved_chat_id, limit=limit, after=after, before=before,
@@ -1238,10 +1246,7 @@ class TelegramMCPClient:
         if format not in ("json", "csv"):
             raise ValueError(f"Invalid format: {format}. Must be json or csv.")
 
-        resolved_chat_id = None
-        if chat_id:
-            chat_id = validate_chat_id(chat_id)
-            resolved_chat_id = chat_id if isinstance(chat_id, int) else None
+        resolved_chat_id = _cache_only_chat_id(chat_id)
 
         messages = self._cache.export_messages(
             chat_id=resolved_chat_id, limit=limit, after=after, before=before,
