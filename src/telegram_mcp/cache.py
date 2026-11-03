@@ -155,14 +155,20 @@ class MessageCache:
         query: str,
         chat_id: int | None = None,
         limit: int = 50,
+        chat_ids: list[int] | None = None,
     ) -> list[dict]:
-        """Search messages by text using LIKE, optionally filtered by chat_id."""
+        """Search by text with optional single-chat or multi-chat scope."""
+        if chat_ids is not None and not chat_ids:
+            return []
         sql = f"SELECT {_MSG_COLUMNS} FROM messages WHERE text LIKE ?"
         params: list = [f"%{query}%"]
 
         if chat_id is not None:
             sql += " AND chat_id = ?"
             params.append(chat_id)
+        if chat_ids is not None:
+            sql += f" AND chat_id IN ({','.join('?' for _ in chat_ids)})"
+            params.extend(chat_ids)
 
         sql += " ORDER BY date DESC LIMIT ?"
         params.append(limit)
