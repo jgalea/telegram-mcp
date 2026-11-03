@@ -338,21 +338,23 @@ class TelegramMCPClient:
                 chat_type = "channel" if d.entity.broadcast else "group"
             elif isinstance(d.entity, Chat):
                 chat_type = "group"
+            peer_id = utils.get_peer_id(d.entity)
             info = {
                 "id": d.entity.id,
+                "peer_id": peer_id,
                 "name": fence(d.name, "title"),
                 "type": chat_type,
                 "unread_count": d.unread_count,
             }
             result.append(info)
-            self._cache.cache_chat(d.entity.id, d.name, chat_type)
+            self._cache.cache_chat(peer_id, d.name, chat_type)
         return result
 
     async def get_chat_info(self, chat_id: int | str) -> dict[str, Any]:
         self._rl_fetch.acquire()
         chat_id = validate_chat_id(chat_id)
         entity = await self._client.get_entity(chat_id)
-        info: dict[str, Any] = {"id": entity.id}
+        info: dict[str, Any] = {"id": entity.id, "peer_id": utils.get_peer_id(entity)}
 
         if isinstance(entity, User):
             info.update({
@@ -1073,7 +1075,8 @@ class TelegramMCPClient:
             chat_name = entity.title or ""
             chat_type = "channel" if (isinstance(entity, Channel) and entity.broadcast) else "group"
 
-        min_id = self._cache.get_last_msg_id(entity.id) or 0
+        peer_id = utils.get_peer_id(entity)
+        min_id = self._cache.get_last_msg_id(peer_id) or 0
         limit = min(limit, 5000)
 
         batch: list[dict[str, Any]] = []
@@ -1095,9 +1098,10 @@ class TelegramMCPClient:
         if batch:
             self._cache.insert_batch(batch)
 
-        self._cache.cache_chat(entity.id, chat_name, chat_type)
+        self._cache.cache_chat(peer_id, chat_name, chat_type)
         return {
             "chat_id": entity.id,
+            "peer_id": peer_id,
             "chat_name": fence(chat_name, "title"),
             "messages_synced": total_fetched,
         }
@@ -1122,7 +1126,8 @@ class TelegramMCPClient:
             elif isinstance(d.entity, Chat):
                 chat_type = "group"
 
-            min_id = self._cache.get_last_msg_id(d.entity.id) or 0
+            peer_id = utils.get_peer_id(d.entity)
+            min_id = self._cache.get_last_msg_id(peer_id) or 0
             batch: list[dict[str, Any]] = []
             chat_count = 0
 
@@ -1146,10 +1151,11 @@ class TelegramMCPClient:
             if batch:
                 self._cache.insert_batch(batch)
 
-            self._cache.cache_chat(d.entity.id, d.name, chat_type)
+            self._cache.cache_chat(peer_id, d.name, chat_type)
             total_messages += chat_count
             results.append({
                 "chat_id": d.entity.id,
+                "peer_id": peer_id,
                 "chat_name": fence(d.name, "title"),
                 "messages_synced": chat_count,
             })

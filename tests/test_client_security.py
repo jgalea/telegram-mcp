@@ -10,7 +10,7 @@ import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telethon.tl.types import Message, MessageMediaDocument, MessageMediaPhoto
+from telethon.tl.types import Message, MessageMediaDocument, MessageMediaPhoto, User
 
 from telegram_mcp.cache import MessageCache
 from telegram_mcp.client import TelegramMCPClient, _fence_message, _msg_to_dict
@@ -135,12 +135,14 @@ class TestScheduledAndSyncFencing:
         assert MARKER not in out[0]["text"]
 
     async def test_sync_chat_fences_chat_name(self, client):
-        from telethon.tl.types import Channel
+        from datetime import datetime, timezone
 
-        entity = MagicMock(spec=Channel)
-        entity.id = 100
-        entity.title = MARKER
-        entity.broadcast = False
+        from telethon.tl.types import Channel, ChatPhotoEmpty
+
+        entity = Channel(
+            id=100, title=MARKER, photo=ChatPhotoEmpty(),
+            date=datetime.now(timezone.utc), broadcast=False,
+        )
         client._client.get_entity.return_value = entity
         client._client._iter = []
         out = await client.sync_chat(100)
@@ -149,8 +151,7 @@ class TestScheduledAndSyncFencing:
     async def test_sync_messages_fences_chat_names(self, client):
         dialog = MagicMock()
         dialog.name = MARKER
-        dialog.entity = MagicMock()
-        dialog.entity.id = 100
+        dialog.entity = User(id=100)
         client._client.get_dialogs.return_value = [dialog]
         client._client._iter = []
         out = await client.sync_messages()
